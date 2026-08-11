@@ -1072,24 +1072,6 @@ inline __device__ void WaitRemoteNodePartials(EpDispatchCombineArgs<T>& args) {
 }
 
 template <typename T>
-inline __device__ void WaitRemoteNodePartialsCta(EpDispatchCombineArgs<T>& args) {
-  DEF_COMMON_VARS;
-  // At decode payloads above one quarter of configured rank capacity, the incoming transfer can
-  // still be live when Finalize starts. One waiter warp per CTA preserves distributed receive
-  // progress while avoiding warpNum identical uncached QP polls. For smaller payloads the signal
-  // is normally ready and the CTA barrier costs more than the duplicate loads, so keep the
-  // original no-barrier fast path.
-  const int ctaWaitMinTokens =
-      max(core::CeilDiv(config.MaxNumTokensToSendPerRank(), 4), 1);
-  if (args.curRankNumToken < ctaWaitMinTokens) {
-    WaitRemoteNodePartials(args);
-    return;
-  }
-  if (warpId == 0) WaitRemoteNodePartials(args);
-  __syncthreads();
-}
-
-template <typename T>
 inline __device__ void FinalizeNodePartials(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   T* staging = args.interNodeV1TokBufs.staging->template GetAs<T*>();
@@ -1298,7 +1280,7 @@ __device__ void EpCombineInterNodeV2LLSendLocalTokenMajorV16_body(
 template <typename T>
 __device__ void EpCombineInterNodeV2LLFinalize_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
-  v2::WaitRemoteNodePartialsCta(args);
+  v2::WaitRemoteNodePartials(args);
   v2::FinalizeNodePartials(args);
   // Reset consumes the expert-major buffers only after every finalize CTA is done. Keeping this
   // epilogue in the same launch removes the dedicated Reset kernel from the critical path.
