@@ -149,9 +149,16 @@ class EpDispatchCombineConfig:
         kernel_type: Dispatch/combine kernel implementation to use.
         gpu_per_node: Number of GPUs per node. This affects all kernel types.
         rdma_block_num: Number of RDMA blocks for inter-node kernels.
-        num_qp_per_pe: Number of queue pairs per processing element.
+        num_qp_per_pe: Number of queue pairs per processing element. ``0`` selects
+            the resolved default (2 for InterNodeV2LL, 1 otherwise). Explicit
+            values from 1 through 8 are supported.
+        v2_layout: Output layout for V2LL. ``"expert_major"`` writes the Group
+            GEMM input grouped by local expert; ``"token_major"`` matches the
+            V1LL token-major contract.
         quant_type: Quantization mode. Supported string values are ``"none"``,
             ``"fp8_direct_cast"``, and ``"fp8_blockwise"``.
+        v2_copy_block_num: Number of fused Dispatch staging-copy CTAs. Zero
+            derives a topology-independent default from the launch geometry.
     """
 
     data_type: (
@@ -173,8 +180,10 @@ class EpDispatchCombineConfig:
     kernel_type: EpDispatchCombineKernelType = EpDispatchCombineKernelType.IntraNode
     gpu_per_node: int = 8
     rdma_block_num: int = 0
-    num_qp_per_pe: int = 1
+    num_qp_per_pe: int = 0
     quant_type: str = "none"
+    v2_layout: str = "expert_major"
+    v2_copy_block_num: int = 0
 
 
 def _cpp_dispatch_combine_factory(entity_name, allow_missing=False):
@@ -192,8 +201,14 @@ _KERNEL_TYPE_TO_HIP = {
     EpDispatchCombineKernelType.InterNode: "ep_internode",
     EpDispatchCombineKernelType.InterNodeV1: "ep_internode_v1",
     EpDispatchCombineKernelType.InterNodeV1LL: "ep_internode_v1ll",
+    EpDispatchCombineKernelType.InterNodeV2LL: "ep_internode_v2",
     EpDispatchCombineKernelType.AsyncLL: "ep_async_ll",
 }
+
+
+def _is_v2_direct_type(kernel_type):
+    return kernel_type.value == EpDispatchCombineKernelType.InterNodeV2LL.value
+
 
 # dtype → kernel name suffix
 _DTYPE_SUFFIX = {
@@ -249,6 +264,25 @@ def _load_hip_modules(kernel_type):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        if not 0 <= config.num_qp_per_pe <= 8:
+            raise ValueError(
+                "num_qp_per_pe must be 0 (auto) or an explicit value in [1, 8], "
+                f"got {config.num_qp_per_pe}"
+            )
+        if config.num_qp_per_pe == 0:
+            config.num_qp_per_pe = 2 if _is_v2_direct_type(config.kernel_type) else 1
+        if config.v2_layout not in ("expert_major", "token_major"):
+            raise ValueError(
+                "v2_layout must be expert_major or token_major, got "
+                f"{config.v2_layout!r}"
+            )
+        if config.v2_copy_block_num < 0:
+            raise ValueError("v2_copy_block_num must be non-negative")
+        if _is_v2_direct_type(config.kernel_type) and config.max_token_type_size < 2:
+            raise ValueError(
+                "InterNodeV2LL max_token_type_size must be at least 2 for "
+                "BF16 Combine buffers"
+            )
         _ensure_jit_kernels(config.kernel_type)
 
         if dist.is_initialized():
@@ -275,9 +309,16 @@ class EpDispatchCombineOp:
             quant_type=_normalize_quant_type(config.quant_type),
             max_total_recv_tokens=config.max_total_recv_tokens,
         )
-
-        self._handle = handle_class(self._cpp_config)
-        self._hip_module = _load_hip_modules(config.kernel_type)
+        # Some SHMEM allocation/registration paths temporarily select devices by global PE.
+        # Preserve the framework's node-local device across construction; otherwise ranks on
+        # nonzero nodes can leave HIP on an ordinal outside the process-visible 0..N-1 range and
+        # later zero-copy tensor views bind to an invalid device.
+        framework_device = torch.cuda.current_device()
+        try:
+            self._handle = handle_class(self._cpp_config)
+            self._hip_module = _load_hip_modules(config.kernel_type)
+        finally:
+            torch.cuda.set_device(framework_device)
         self._handle_info = mori_cpp.get_handle_info(self._handle)
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
@@ -410,6 +451,16 @@ class EpDispatchCombineOp:
                     self.auto_rdma_block_num,
                     self.auto_warp_per_block,
                 ) = (256, 128, 8)
+            elif _is_v2_direct_type(config.kernel_type):
+                (
+                    self.auto_block_num,
+                    self.auto_rdma_block_num,
+                    self.auto_warp_per_block,
+                ) = (
+                    min(config.block_num, self._handle_info["multi_processor_count"]),
+                    config.rdma_block_num,
+                    config.warp_num_per_block,
+                )
             else:
                 (
                     self.auto_block_num,
@@ -471,6 +522,24 @@ class EpDispatchCombineOp:
     def _get_func(self, name):
         return self._hip_module.get_function(name)
 
+    def _get_adapter_func(self, name):
+        """Load standalone Standard-MoE adapter kernels from ep_intranode.
+
+        These kernels are transport-independent and are emitted only by the
+        ep_intranode JIT source, even when the owning EP op uses an inter-node
+        implementation.
+        """
+        if not hasattr(self, "_adapter_hip_module"):
+            from mori.ops._jit_loader import ensure_compiled, load_hip_module
+
+            ensure_compiled("ep_intranode")
+            self._adapter_hip_module = load_hip_module("ep_intranode", init_shmem=True)
+        return self._adapter_hip_module.get_function(name)
+
+    def _launch_adapter(self, func_name, grid, block, shared_mem, stream, args_ptr):
+        func = self._get_adapter_func(func_name)
+        func.launch_struct(grid, block, shared_mem, stream, args_ptr)
+
     def _dispatch_shared_mem(self, warp_per_block):
         """Shared memory for dispatch kernels (worldSize + numExpertPerRank per warp + numExpertPerRank) * sizeof(index_t)."""
         return (
@@ -482,15 +551,16 @@ class EpDispatchCombineOp:
     def _combine_shared_mem(self, warp_per_block, use_weights=True):
         """Shared memory for combine kernels."""
         quant_type = _normalize_quant_type(self.config.quant_type)
+        shared_slots = self.config.num_experts_per_token
+        if _is_v2_direct_type(self.config.kernel_type):
+            shared_slots = max(
+                shared_slots,
+                self.config.world_size // self.config.gpu_per_node,
+            )
         num_ptr_arrays = 1 + int(bool(use_weights))
         if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
             num_ptr_arrays += 1
-        return (
-            warp_per_block
-            * self.config.num_experts_per_token
-            * num_ptr_arrays
-            * _PTR_SIZE
-        )
+        return warp_per_block * shared_slots * num_ptr_arrays * _PTR_SIZE
 
     def _launch(self, func_name, grid, block, shared_mem, stream, args_ptr):
         func = self._get_func(func_name)
@@ -636,6 +706,11 @@ class EpDispatchCombineOp:
         routing: "EpDispatchRoutingHandle | None" = None,
         return_routing: bool = False,
     ):
+        if _is_v2_direct_type(self.config.kernel_type):
+            raise ValueError(
+                "InterNodeV2LL uses a registered Group GEMM layout; use "
+                "dispatch_v2_standard_moe()"
+            )
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either `routing=` (replay) or `return_routing=True` "
@@ -915,6 +990,11 @@ class EpDispatchCombineOp:
         *,
         routing: "EpDispatchRoutingHandle | None" = None,
     ):
+        if _is_v2_direct_type(self.config.kernel_type):
+            raise ValueError(
+                "InterNodeV2LL consumes a registered Group GEMM output; use "
+                "combine_standard_moe() with the registered V2 combine buffer"
+            )
         if routing is not None and not self._supports_routing_handle():
             raise NotImplementedError(
                 f"routing handle path not supported for kernel_type="
@@ -1412,6 +1492,265 @@ class EpDispatchCombineOp:
             packed_recv_layout_range,
         )
 
+    def dispatch_v2_standard_moe(
+        self,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        indices: torch.Tensor,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+    ):
+        """Dispatch directly into registered V2 Group-GEMM buffers.
+
+        Every ``(token, expert)`` route receives its own expert slot. The returned
+        X/scales/weights can be consumed directly by Group GEMM without
+        ``ConvertDispatchOutput``. ``indices`` is part of the Standard-MoE
+        contract: it must be int32, use ``-1`` only for masked routes, and contain
+        no duplicate valid expert id within one token. The caller is responsible
+        for providing in-range, unique expert ids.
+        """
+        if self.config.kernel_type != EpDispatchCombineKernelType.InterNodeV2LL:
+            raise ValueError("dispatch_v2_standard_moe requires InterNodeV2LL")
+        if input.ndim != 2:
+            raise ValueError(
+                f"V2LL input must be 2D [tokens, hidden], got shape={tuple(input.shape)}"
+            )
+        if input.size(0) > self.config.max_num_inp_token_per_rank:
+            raise ValueError(
+                "V2LL input exceeds max_num_inp_token_per_rank: "
+                f"{input.size(0)} > {self.config.max_num_inp_token_per_rank}"
+            )
+        expected_indices_shape = (
+            int(input.size(0)),
+            self.config.num_experts_per_token,
+        )
+        if input.dtype not in _DTYPE_SUFFIX or _DTYPE_SUFFIX[input.dtype] not in (
+            "bf16",
+            "fp8_fnuz",
+            "fp8_ocp",
+        ):
+            raise ValueError(
+                f"V2LL Dispatch supports BF16 or FP8 input, got {input.dtype}"
+            )
+        if (
+            tuple(weights.shape) != expected_indices_shape
+            or weights.dtype != torch.float32
+        ):
+            raise ValueError(
+                "V2 Standard-MoE weights must have shape "
+                f"{expected_indices_shape} and dtype torch.float32, got "
+                f"shape={tuple(weights.shape)}, dtype={weights.dtype}"
+            )
+        if tuple(indices.shape) != expected_indices_shape:
+            raise ValueError(
+                "V2 Standard-MoE indices must have shape "
+                f"{expected_indices_shape}, got {tuple(indices.shape)}"
+            )
+        if indices.dtype != torch.int32:
+            raise ValueError(
+                f"V2 Standard-MoE indices must be torch.int32, got {indices.dtype}"
+            )
+        if input.device != weights.device or input.device != indices.device:
+            raise ValueError(
+                "V2LL input, weights, and indices must be on the same device"
+            )
+        if (
+            not input.is_contiguous()
+            or not weights.is_contiguous()
+            or not indices.is_contiguous()
+        ):
+            raise ValueError("V2LL input, weights, and indices must be contiguous")
+        if scales is not None:
+            expected_scale_shape = (int(input.size(0)), self.config.scale_dim)
+            if (
+                tuple(scales.shape) != expected_scale_shape
+                or scales.device != input.device
+                or not scales.is_contiguous()
+                or scales.element_size() != self.config.scale_type_size
+            ):
+                raise ValueError(
+                    "V2LL scales must be contiguous, on the input device, and have shape "
+                    f"{expected_scale_shape}; got shape={tuple(scales.shape)}, "
+                    f"device={scales.device}, element_size={scales.element_size()}"
+                )
+        hidden_dim = input.size(1)
+        if hidden_dim > self.config.hidden_dim:
+            raise ValueError(
+                "V2LL input hidden dimension exceeds configured buffer capacity: "
+                f"{hidden_dim} > {self.config.hidden_dim}"
+            )
+        actual_bn, _, actual_wpb = self._resolve_launch_params(
+            block_num,
+            1,
+            warp_per_block,
+            num_tokens=input.size(0),
+            hidden_dim=hidden_dim,
+            dtype=input.dtype,
+            tuning_rules=self._dispatch_rules,
+        )
+        num_nodes = self.config.world_size // self.config.gpu_per_node
+        if actual_wpb < self.config.num_qp_per_pe:
+            raise ValueError(
+                "V2LL Dispatch requires at least one sender warp per QP: "
+                f"warps={actual_wpb}, qps={self.config.num_qp_per_pe}"
+            )
+        copy_blocks = self.config.v2_copy_block_num or max(
+            self.config.num_qp_per_pe, actual_bn // 4
+        )
+        if copy_blocks >= actual_bn or actual_bn - copy_blocks < num_nodes:
+            raise ValueError(
+                "V2LL Dispatch must leave at least one scatter CTA per node: "
+                f"blocks={actual_bn}, copy_blocks={copy_blocks}, nodes={num_nodes}"
+            )
+        mp = self._handle_info["multi_processor_count"]
+        if actual_bn > mp:
+            raise ValueError(
+                "V2LL fused Dispatch requires a resident grid: "
+                f"block_num={actual_bn} exceeds device CUs={mp}"
+            )
+        if (
+            self.config.v2_layout == "token_major"
+            and copy_blocks < self.config.num_qp_per_pe
+        ):
+            raise ValueError(
+                "token-major V2LL requires at least one copy CTA per QP: "
+                f"copy_blocks={copy_blocks}, qps={self.config.num_qp_per_pe}"
+            )
+
+        stream = _current_stream()
+        sfx = _DTYPE_SUFFIX[input.dtype]
+        mori_cpp.prepare_inference_args(
+            self._handle,
+            inp_ptr=input.data_ptr(),
+            dtype=dtype_to_int(input.dtype),
+            num_tokens=input.size(0),
+            weight_ptr=weights.data_ptr(),
+            scale_ptr=(scales.data_ptr() if scales is not None else 0),
+            indices_ptr=indices.data_ptr(),
+        )
+        args_ptr = mori_cpp.build_args(
+            self._handle,
+            rdma_block_num=0,
+            dispatch_copy_block_num=copy_blocks,
+            hidden_dim=hidden_dim,
+        )
+        block = (WARP_SIZE * actual_wpb,)
+        dispatch_kernel = (
+            "EpDispatchInterNodeV2LLTokenMajor"
+            if self.config.v2_layout == "token_major"
+            else "EpDispatchInterNodeV2LLKernel"
+        )
+        mori_cpp.begin_v2_dispatch(self._handle, stream)
+        try:
+            self._launch(
+                f"{dispatch_kernel}_{sfx}_ring",
+                (actual_bn,),
+                block,
+                0,
+                stream,
+                args_ptr,
+            )
+        except Exception:
+            mori_cpp.abort_v2_dispatch(self._handle)
+            raise
+        mori_cpp.commit_v2_dispatch(self._handle)
+
+        (
+            x_ptr,
+            count_ptr,
+            weight_ptr,
+            scale_ptr,
+            src_ptr,
+            max_per_expert,
+        ) = mori_cpp.get_v2_dispatch_output_ptrs(self._handle)
+        if self.config.v2_layout == "token_major":
+            max_recv_tokens = (
+                self.config.world_size * self.config.max_num_inp_token_per_rank
+            )
+            token_x = from_gpu_ptr(x_ptr, (max_recv_tokens, hidden_dim), input.dtype)
+            # Token-major publishes its V1LL-compatible total row count into symmetric counter
+            # slot 0 at the Dispatch generation-completion edge.
+            token_count = from_gpu_ptr(
+                count_ptr,
+                (1,),
+                torch.int32,
+            )
+            token_weights = from_gpu_ptr(
+                weight_ptr,
+                (max_recv_tokens, self.config.num_experts_per_token),
+                torch.float32,
+            )
+            token_indices = from_gpu_ptr(
+                mori_cpp.get_v2_token_major_indices_ptr(self._handle),
+                (max_recv_tokens, self.config.num_experts_per_token),
+                torch.int32,
+            )
+            token_scales = None
+            if scale_ptr and scales is not None:
+                token_scales = from_gpu_ptr(
+                    scale_ptr,
+                    (max_recv_tokens, scales.size(1)),
+                    scales.dtype,
+                )
+            token_src_info = from_gpu_ptr(src_ptr, (max_recv_tokens,), torch.int32)
+            return (
+                token_x,
+                token_count,
+                token_weights,
+                token_indices,
+                token_scales,
+                token_src_info,
+            )
+        experts = self.config.num_experts_per_rank
+        packed_x = from_gpu_ptr(
+            x_ptr, (experts, max_per_expert, hidden_dim), input.dtype
+        )
+        packed_count = from_gpu_ptr(count_ptr, (experts,), torch.int32)
+        packed_weights = from_gpu_ptr(
+            weight_ptr, (experts, max_per_expert), torch.float32
+        )
+        packed_scales = None
+        if scale_ptr and scales is not None:
+            packed_scales = from_gpu_ptr(
+                scale_ptr,
+                (experts, max_per_expert, scales.size(1)),
+                scales.dtype,
+            )
+        packed_src_info = from_gpu_ptr(src_ptr, (experts, max_per_expert), torch.int32)
+        return (
+            packed_x,
+            packed_count,
+            packed_weights,
+            packed_scales,
+            packed_src_info,
+        )
+
+    def get_v2_registered_combine_input_buffer(
+        self, dtype: torch.dtype, hidden_dim: int = -1
+    ):
+        if self.config.kernel_type != EpDispatchCombineKernelType.InterNodeV2LL:
+            raise ValueError("V2 combine input buffer requires InterNodeV2LL")
+        if dtype != torch.bfloat16:
+            raise ValueError("V2 combine input buffer is BF16")
+        if hidden_dim > self.config.hidden_dim:
+            raise ValueError(
+                "V2LL combine hidden dimension exceeds configured buffer capacity: "
+                f"{hidden_dim} > {self.config.hidden_dim}"
+            )
+        (
+            ptr,
+            experts,
+            max_per_expert,
+            actual_hidden,
+        ) = mori_cpp.get_v2_combine_input_buffer(self._handle, hidden_dim)
+        if self.config.v2_layout == "token_major":
+            max_recv_tokens = (
+                self.config.world_size * self.config.max_num_inp_token_per_rank
+            )
+            return from_gpu_ptr(ptr, (max_recv_tokens, actual_hidden), dtype)
+        return from_gpu_ptr(ptr, (experts, max_per_expert, actual_hidden), dtype)
+
     def combine_standard_moe(
         self,
         input: torch.Tensor,
@@ -1422,20 +1761,24 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
-        set_fn = _cpp_dispatch_combine_factory(
-            "set_standard_moe_output_buffers", allow_missing=True
-        )
-        if set_fn is None:
-            raise RuntimeError(
-                "combine_standard_moe is not available. "
-                "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+        kt = self.config.kernel_type.value
+        set_fn = None
+        if kt != EpDispatchCombineKernelType.InterNodeV2LL.value:
+            set_fn = _cpp_dispatch_combine_factory(
+                "set_standard_moe_output_buffers", allow_missing=True
             )
-        hidden_dim = input.size(2)
+            if set_fn is None:
+                raise RuntimeError(
+                    "combine_standard_moe is not available. "
+                    "Rebuild with ENABLE_STANDARD_MOE_ADAPT=ON."
+                )
+        hidden_dim = input.size(-1)
+        cur_n = self._get_cur_rank_num_token(self._handle)
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
             block_num,
             rdma_block_num,
             warp_per_block,
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             hidden_dim=hidden_dim,
             dtype=input.dtype,
             tuning_rules=self._combine_rules,
@@ -1445,13 +1788,14 @@ class EpDispatchCombineOp:
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
 
-        set_fn(self._handle, input.data_ptr(), 0)
+        if set_fn is not None:
+            set_fn(self._handle, input.data_ptr(), 0)
 
         mori_cpp.prepare_inference_args(
             self._handle,
             inp_ptr=input.data_ptr(),
             dtype=dtype_to_int(input.dtype),
-            num_tokens=self._get_cur_rank_num_token(self._handle),
+            num_tokens=cur_n,
             weight_ptr=(
                 weights.data_ptr()
                 if weights is not None and weights.size(0) != 0
@@ -1463,14 +1807,13 @@ class EpDispatchCombineOp:
         args_ptr = mori_cpp.build_args(
             self._handle,
             rdma_block_num=actual_rbn,
+            dispatch_copy_block_num=0,
             hidden_dim=hidden_dim,
         )
 
         grid = (actual_bn,)
         block = (WARP_SIZE * actual_wpb,)
         shared_mem = self._combine_shared_mem(actual_wpb)
-        kt = self.config.kernel_type.value
-
         if kt == EpDispatchCombineKernelType.InterNodeV1LL.value:
             mp = self._handle_info["multi_processor_count"]
             self._launch(f"EpCombineSync_{sfx}", (mp,), block, 0, stream, args_ptr)
@@ -1488,6 +1831,98 @@ class EpDispatchCombineOp:
             self._launch(
                 f"EpCombineAll_{sfx}", (mp,), block, shared_mem, stream, args_ptr
             )
+        elif kt == EpDispatchCombineKernelType.InterNodeV2LL.value:
+            if input.dtype != torch.bfloat16:
+                raise ValueError(
+                    "InterNodeV2LL Combine requires BF16 Group GEMM output"
+                )
+            if weights is not None:
+                raise ValueError(
+                    "InterNodeV2LL Combine consumes pre-weighted Group GEMM output; "
+                    "weights must be None"
+                )
+            expected_indices_shape = (
+                int(cur_n),
+                self.config.num_experts_per_token,
+            )
+            if (
+                tuple(indices.shape) != expected_indices_shape
+                or indices.dtype != torch.int32
+                or indices.device != input.device
+                or not indices.is_contiguous()
+            ):
+                raise ValueError(
+                    "InterNodeV2LL Combine indices must be contiguous int32 on the "
+                    f"input device with shape={expected_indices_shape}; got "
+                    f"shape={tuple(indices.shape)}, dtype={indices.dtype}, "
+                    f"device={indices.device}"
+                )
+            if actual_wpb < self.config.num_qp_per_pe:
+                raise ValueError(
+                    "V2LL Combine requires at least one sender/waiter warp per QP: "
+                    f"warps={actual_wpb}, qps={self.config.num_qp_per_pe}"
+                )
+            (
+                registered_ptr,
+                registered_experts,
+                registered_capacity,
+                registered_hidden,
+            ) = mori_cpp.get_v2_combine_input_buffer(self._handle, hidden_dim)
+            expected_shape = (
+                (
+                    self.config.world_size * self.config.max_num_inp_token_per_rank,
+                    registered_hidden,
+                )
+                if self.config.v2_layout == "token_major"
+                else (
+                    registered_experts,
+                    registered_capacity,
+                    registered_hidden,
+                )
+            )
+            if tuple(input.shape) != expected_shape or not input.is_contiguous():
+                raise ValueError(
+                    "InterNodeV2LL Combine requires the full contiguous registered "
+                    f"buffer with shape={expected_shape}; got shape={tuple(input.shape)}"
+                )
+            if input.data_ptr() != registered_ptr:
+                raise ValueError(
+                    "InterNodeV2LL Group GEMM output must be written directly into "
+                    "get_v2_registered_combine_input_buffer()"
+                )
+            if hidden_dim != registered_hidden:
+                raise ValueError(
+                    f"V2LL combine hidden_dim mismatch: input={hidden_dim}, "
+                    f"registered={registered_hidden}"
+                )
+            remote_kernel = (
+                "EpCombineInterNodeV2LLRemotePartialTokenMajorV16"
+                if self.config.v2_layout == "token_major"
+                else "EpCombineInterNodeV2LLRemotePartialV16"
+            )
+            local_kernel = (
+                "EpCombineInterNodeV2LLSendLocalTokenMajorV16"
+                if self.config.v2_layout == "token_major"
+                else "EpCombineInterNodeV2LLSendLocalV16"
+            )
+            mori_cpp.begin_v2_combine(self._handle, stream)
+            try:
+                self._launch_multi(
+                    [
+                        f"{remote_kernel}_bf16",
+                        f"{local_kernel}_bf16",
+                        "EpCombineInterNodeV2LLFinalize_bf16",
+                    ],
+                    [actual_bn, actual_bn, actual_bn],
+                    [block[0], block[0], block[0]],
+                    [shared_mem, shared_mem, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            except Exception:
+                mori_cpp.abort_v2_combine(self._handle)
+                raise
+            mori_cpp.commit_v2_combine(self._handle)
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
             self._launch(
                 f"EpCombineIntraNodeKernel_{sfx}_p2p_stdmoe",
@@ -1499,7 +1934,8 @@ class EpDispatchCombineOp:
             )
         else:
             raise ValueError(
-                "combine_standard_moe only supports IntraNode/InterNodeV1LL"
+                "combine_standard_moe only supports "
+                "IntraNode/InterNodeV1LL/InterNodeV2LL"
             )
 
         out_ptr = self._combine_out_ptrs[0]
@@ -1520,6 +1956,10 @@ class EpDispatchCombineOp:
         dispatch_out_topk_idx: torch.Tensor,
         block_num: int = -1,
         warp_per_block: int = -1,
+        packed_recv_x: torch.Tensor = None,
+        packed_recv_src_info: torch.Tensor = None,
+        dispatch_out_scales: torch.Tensor = None,
+        packed_recv_scales: torch.Tensor = None,
     ):
         build_fn = _cpp_dispatch_combine_factory(
             "build_convert_dispatch_output_args", allow_missing=True
@@ -1540,16 +1980,80 @@ class EpDispatchCombineOp:
         )
         stream = _current_stream()
 
-        packed_recv_x = torch.empty(
-            (num_local_experts, max_tokens_per_expert, hidden_dim),
-            dtype=dispatch_out_x.dtype,
-            device=dispatch_out_x.device,
-        )
-        packed_recv_src_info = torch.empty(
-            (num_local_experts, max_tokens_per_expert),
-            dtype=torch.int32,
-            device=dispatch_out_x.device,
-        )
+        expected_x_shape = (num_local_experts, max_tokens_per_expert, hidden_dim)
+        expected_src_shape = (num_local_experts, max_tokens_per_expert)
+        if packed_recv_x is None:
+            packed_recv_x = torch.empty(
+                expected_x_shape,
+                dtype=dispatch_out_x.dtype,
+                device=dispatch_out_x.device,
+            )
+        elif (
+            tuple(packed_recv_x.shape) != expected_x_shape
+            or packed_recv_x.dtype != dispatch_out_x.dtype
+            or packed_recv_x.device != dispatch_out_x.device
+        ):
+            raise ValueError(
+                "packed_recv_x must match "
+                f"shape={expected_x_shape}, dtype={dispatch_out_x.dtype}, "
+                f"device={dispatch_out_x.device}; got shape={tuple(packed_recv_x.shape)}, "
+                f"dtype={packed_recv_x.dtype}, device={packed_recv_x.device}"
+            )
+        if packed_recv_src_info is None:
+            packed_recv_src_info = torch.empty(
+                expected_src_shape,
+                dtype=torch.int32,
+                device=dispatch_out_x.device,
+            )
+        elif (
+            tuple(packed_recv_src_info.shape) != expected_src_shape
+            or packed_recv_src_info.dtype != torch.int32
+            or packed_recv_src_info.device != dispatch_out_x.device
+        ):
+            raise ValueError(
+                "packed_recv_src_info must match "
+                f"shape={expected_src_shape}, dtype=torch.int32, "
+                f"device={dispatch_out_x.device}; got "
+                f"shape={tuple(packed_recv_src_info.shape)}, "
+                f"dtype={packed_recv_src_info.dtype}, "
+                f"device={packed_recv_src_info.device}"
+            )
+        scale_bytes_per_token = 0
+        if dispatch_out_scales is not None:
+            if dispatch_out_scales.ndim != 2:
+                raise ValueError(
+                    "dispatch_out_scales must be 2D [tokens, scale_dim], got "
+                    f"shape={tuple(dispatch_out_scales.shape)}"
+                )
+            expected_scale_shape = (
+                num_local_experts,
+                max_tokens_per_expert,
+                dispatch_out_scales.size(1),
+            )
+            if packed_recv_scales is None:
+                packed_recv_scales = torch.empty(
+                    expected_scale_shape,
+                    dtype=dispatch_out_scales.dtype,
+                    device=dispatch_out_scales.device,
+                )
+            elif (
+                tuple(packed_recv_scales.shape) != expected_scale_shape
+                or packed_recv_scales.dtype != dispatch_out_scales.dtype
+                or packed_recv_scales.device != dispatch_out_scales.device
+            ):
+                raise ValueError(
+                    "packed_recv_scales must match "
+                    f"shape={expected_scale_shape}, dtype={dispatch_out_scales.dtype}, "
+                    f"device={dispatch_out_scales.device}; got "
+                    f"shape={tuple(packed_recv_scales.shape)}, "
+                    f"dtype={packed_recv_scales.dtype}, "
+                    f"device={packed_recv_scales.device}"
+                )
+            scale_bytes_per_token = (
+                dispatch_out_scales.size(1) * dispatch_out_scales.element_size()
+            )
+        elif packed_recv_scales is not None:
+            raise ValueError("packed_recv_scales requires dispatch_out_scales")
         packed_recv_layout_range = torch.empty(
             0, dtype=torch.int64, device=dispatch_out_x.device
         )
@@ -1561,11 +2065,15 @@ class EpDispatchCombineOp:
             packed_recv_x.data_ptr(),
             packed_recv_src_info.data_ptr(),
             hidden_dim,
+            dispatch_out_x.element_size(),
+            dispatch_out_scales.data_ptr() if dispatch_out_scales is not None else 0,
+            packed_recv_scales.data_ptr() if packed_recv_scales is not None else 0,
+            scale_bytes_per_token,
         )
         try:
             grid = (actual_bn,)
             block = (WARP_SIZE * actual_wpb,)
-            self._launch(
+            self._launch_adapter(
                 "mori_ConvertDispatchOutputKernel", grid, block, 0, stream, args_ptr
             )
         finally:
@@ -1618,7 +2126,7 @@ class EpDispatchCombineOp:
         try:
             grid = (actual_bn,)
             block = (WARP_SIZE * actual_wpb,)
-            self._launch(
+            self._launch_adapter(
                 f"ConvertCombineInputKernel_{sfx}", grid, block, 0, stream, args_ptr
             )
         finally:
@@ -1721,7 +2229,11 @@ class EpDispatchCombineOp:
                 )
                 raise
             src_tok_id = reverse_sender_token_id_map[recv_mapped_id]
-            src_token_pos.append(src_pe * max_num_token_to_send_per_rank + src_tok_id)
+            # Match FlatTokenIndex used by the V1/LL kernels so callers can
+            # decode every implementation with decode_send_flat_idx().  The
+            # legacy reconstruction previously used the send-buffer slot
+            # stride, which made EP>1 source token IDs decode out of bounds.
+            src_token_pos.append(src_pe * self.max_num_tokens_to_send() + src_tok_id)
 
         return torch.tensor(src_token_pos, dtype=torch.int)
 

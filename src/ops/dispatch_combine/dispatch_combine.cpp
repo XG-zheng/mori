@@ -47,6 +47,98 @@ static constexpr int32_t EP_CONFIG_I32_VERSION = 1;
 static constexpr int kDefaultFp8BlockwiseScaleDim = 56;
 static constexpr const char* kFp8BlockwiseScaleDimEnv = "MORI_FP8_COMBINE_SCALE_DIM";
 
+namespace {
+
+constexpr size_t kV2LLControlBarrierWords = 16;
+
+const char* V2PhaseName(EpDispatchCombineHandle::V2LifecyclePhase phase) {
+  switch (phase) {
+    case EpDispatchCombineHandle::V2LifecyclePhase::ReadyDispatch:
+      return "ready-dispatch";
+    case EpDispatchCombineHandle::V2LifecyclePhase::LaunchingDispatch:
+      return "launching-dispatch";
+    case EpDispatchCombineHandle::V2LifecyclePhase::ReadyCombine:
+      return "ready-combine";
+    case EpDispatchCombineHandle::V2LifecyclePhase::LaunchingCombine:
+      return "launching-combine";
+  }
+  return "unknown";
+}
+
+}  // namespace
+
+void EpDispatchCombineHandle::BeginV2Dispatch(hipStream_t stream) {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase != V2LifecyclePhase::ReadyDispatch) {
+    throw std::runtime_error(std::string("V2 lifecycle rejects Dispatch while phase is ") +
+                             V2PhaseName(v2LifecyclePhase));
+  }
+  if (v2LifecycleStreamBound && v2LifecycleStream != stream) {
+    throw std::runtime_error("V2 lifecycle rejects cross-stream use of the same handle");
+  }
+  v2LifecycleStream = stream;
+  v2LifecycleStreamBound = true;
+  switch (inputType) {
+    case HIP_R_32F:
+      v2DispatchElemSize = sizeof(float);
+      break;
+    case HIP_R_16BF:
+      v2DispatchElemSize = 2;
+      break;
+    case HIP_R_8F_E4M3:
+    case HIP_R_8F_E4M3_FNUZ:
+      v2DispatchElemSize = 1;
+      break;
+    default:
+      throw std::runtime_error("V2 Dispatch does not support the prepared input type");
+  }
+  v2LifecyclePhase = V2LifecyclePhase::LaunchingDispatch;
+}
+
+void EpDispatchCombineHandle::CommitV2Dispatch() {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase != V2LifecyclePhase::LaunchingDispatch)
+    throw std::runtime_error("V2 lifecycle Dispatch commit without begin");
+  v2LifecyclePhase = V2LifecyclePhase::ReadyCombine;
+}
+
+void EpDispatchCombineHandle::AbortV2Dispatch() {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase == V2LifecyclePhase::LaunchingDispatch)
+    v2LifecyclePhase = V2LifecyclePhase::ReadyDispatch;
+}
+
+void EpDispatchCombineHandle::BeginV2Combine(hipStream_t stream) {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase != V2LifecyclePhase::ReadyCombine) {
+    throw std::runtime_error(std::string("V2 lifecycle rejects Combine while phase is ") +
+                             V2PhaseName(v2LifecyclePhase));
+  }
+  if (!v2LifecycleStreamBound || v2LifecycleStream != stream) {
+    throw std::runtime_error("V2 lifecycle rejects cross-stream use of the same handle");
+  }
+  v2LifecyclePhase = V2LifecyclePhase::LaunchingCombine;
+}
+
+void EpDispatchCombineHandle::CommitV2Combine() {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase != V2LifecyclePhase::LaunchingCombine)
+    throw std::runtime_error("V2 lifecycle Combine commit without begin");
+  v2LifecyclePhase = V2LifecyclePhase::ReadyDispatch;
+}
+
+void EpDispatchCombineHandle::AbortV2Combine() {
+  if (!IsInterNodeV2DirectType(config.kernelType)) return;
+  std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  if (v2LifecyclePhase == V2LifecyclePhase::LaunchingCombine)
+    v2LifecyclePhase = V2LifecyclePhase::ReadyCombine;
+}
+
 std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
   return {
       EP_CONFIG_I32_VERSION,
@@ -110,12 +202,30 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
 /* ---------------------------------------------------------------------------------------------- */
 EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_)
     : config(config_) {
-  assert(IsPowerOf2(config.gpuPerNode) && (config.worldSize % config.gpuPerNode == 0));
+  if (!IsPowerOf2(config.gpuPerNode) || config.worldSize % config.gpuPerNode != 0) {
+    throw std::invalid_argument(
+        "gpuPerNode must be a power of two and divide worldSize");
+  }
+  if (IsInterNodeV2DirectType(config.kernelType) &&
+      (config.numQpPerPe < 1 || config.numQpPerPe > 8)) {
+    throw std::invalid_argument("InterNodeV2LL numQpPerPe must be in [1, 8]");
+  }
+  if (IsInterNodeV2DirectType(config.kernelType) && config.maxTokenTypeSize < 2) {
+    throw std::invalid_argument(
+        "InterNodeV2LL maxTokenTypeSize must be at least 2 for BF16 Combine buffers");
+  }
   int shmemNumQpPerPe = ShmemNumQpPerPe();
   if (config.numQpPerPe > shmemNumQpPerPe) {
+    const int requestedNumQpPerPe = config.numQpPerPe;
     config.numQpPerPe = shmemNumQpPerPe;
-    MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}", config.numQpPerPe,
-                  shmemNumQpPerPe, shmemNumQpPerPe);
+    MORI_OPS_INFO("numQpPerPe {} larger than shmem numQpPerPe {}, set to {}",
+                  requestedNumQpPerPe, shmemNumQpPerPe, shmemNumQpPerPe);
+  }
+  if (IsInterNodeV2DirectType(config.kernelType)) {
+    if (config.warpNumPerBlock < config.numQpPerPe) {
+      throw std::invalid_argument(
+          "InterNodeV2LL warpNumPerBlock must be >= numQpPerPe");
+    }
   }
 
   if (IsBlockwiseCombineQuant(config.quantType)) {
@@ -173,7 +283,7 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
   if (states->status != mori::shmem::ShmemStatesStatus::Initialized) {
     return;
   }
-  hipDeviceSynchronize();
+  (void)hipDeviceSynchronize();
   (void)hipGetLastError();
   FinalizeShmemBuf();
   FinalizeTokenNumSignalBuf();
@@ -213,20 +323,35 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
-  } else if (config.kernelType == KernelType::InterNodeV1 ||
-             config.kernelType == KernelType::InterNodeV1LL) {
+  } else if (IsInterNodeV1BufferType(config.kernelType)) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNodeV1>();
     const int nNodes = config.worldSize / config.gpuPerNode;
+    // V2LL uses generation-parity transport slots.  The sender may start packing the next
+    // dispatch after the previous combine has advanced the epoch, while the peer is still
+    // consuming the preceding RDMA payload. Keep the original single-slot layout for V1 and
+    // allocate two complete transport generations for V2LL.
+    const size_t transportRingSize =
+        config.kernelType == KernelType::InterNodeV2LL ? size_t{2} : size_t{1};
     size_t dispatchInpSize = static_cast<ssize_t>(nNodes) * config.MaxNumTokensToSendPerRank() *
-                             config.MaxXferBytesPerToken();
+                             config.MaxXferBytesPerToken() * transportRingSize;
     size_t stagingSize = static_cast<ssize_t>(2 * nNodes) * config.MaxNumTokensToSendPerRank() *
-                         config.MaxXferBytesPerToken();
+                         config.MaxXferBytesPerToken() * transportRingSize;
     size_t dispatchStagingSize =
-        static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) * config.MaxXferBytesPerToken();
+        static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) *
+        config.MaxXferBytesPerToken() * transportRingSize;
     bufs.dispatchInp = ShmemMallocAndReturnMemObjPtr(dispatchInpSize, hipDeviceMallocUncached);
-    bufs.combineInp = ShmemMallocAndReturnMemObjPtr(maxStagingSize, hipDeviceMallocUncached);
+    const size_t v2PackedTokenBytes =
+        config.V2PackedTokenSlots() * config.HiddenDimSz() * config.maxTokenTypeSize;
+    const size_t combineInpSize = IsInterNodeV2DirectType(config.kernelType)
+                                      ? v2PackedTokenBytes
+                                      : maxStagingSize;
+    const size_t actualDispatchOutSize = IsInterNodeV2DirectType(config.kernelType)
+                                             ? v2PackedTokenBytes
+                                             : dispatchOutSize;
+    bufs.combineInp = ShmemMallocAndReturnMemObjPtr(combineInpSize, hipDeviceMallocUncached);
     bufs.staging = ShmemMallocAndReturnMemObjPtr(stagingSize, hipDeviceMallocUncached);
-    bufs.dispatchOut = ShmemMallocAndReturnMemObjPtr(dispatchOutSize, hipDeviceMallocUncached);
+    bufs.dispatchOut =
+        ShmemMallocAndReturnMemObjPtr(actualDispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = ShmemMallocAndReturnMemObjPtr(combineOutSize, hipDeviceMallocUncached);
     bufs.dispatchStaging =
         ShmemMallocAndReturnMemObjPtr(dispatchStagingSize, hipDeviceMallocUncached);
@@ -246,6 +371,10 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 
   size_t maxWeightSize =
       static_cast<size_t>(config.MaxNumTokensToRecv()) * config.numExpertPerToken * sizeof(float);
+  if (IsInterNodeV2DirectType(config.kernelType)) {
+    // One routing weight per expert-major slot; no rank-partial top-k array is materialized.
+    maxWeightSize = config.V2PackedTokenSlots() * sizeof(float);
+  }
   shmemInpWeightsMemObj = ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
   shmemDispatchOutWeightsMemObj =
       ShmemMallocAndReturnMemObjPtr(maxWeightSize, hipDeviceMallocUncached);
@@ -256,6 +385,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
   if (config.scaleDim > 0 && config.scaleTypeSize > 0) {
     userScaleSize =
         static_cast<size_t>(config.MaxNumTokensToRecv()) * config.scaleDim * config.scaleTypeSize;
+    if (IsInterNodeV2DirectType(config.kernelType)) {
+      userScaleSize = config.V2PackedTokenSlots() * config.scaleDim * config.scaleTypeSize;
+    }
   }
   size_t fp8BlockwiseScaleSize = 0;
   if (IsBlockwiseCombineQuant(config.quantType) && fp8BlockwiseCombineScaleDim > 0) {
@@ -292,8 +424,7 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
     ShmemFree(bufs.dispatchOut->localPtr);
     ShmemFree(bufs.combineInp->localPtr);
     ShmemFree(bufs.combineOut->localPtr);
-  } else if (config.kernelType == KernelType::InterNodeV1 ||
-             config.kernelType == KernelType::InterNodeV1LL) {
+  } else if (IsInterNodeV1BufferType(config.kernelType)) {
     auto& bufs = std::get<ShmemBufsInterNodeV1>(shmemTokBufs);
     ShmemFree(bufs.dispatchInp->localPtr);
     ShmemFree(bufs.combineInp->localPtr);
@@ -332,7 +463,12 @@ void EpDispatchCombineHandle::InitializeTokenNumSignalBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&totalRecvTokenNum, sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(totalRecvTokenNum, 0, sizeof(index_t)));
 
-  size_t nodeTokenNumSignalSize = config.worldSize / config.gpuPerNode * sizeof(uint64_t);
+  size_t nodeTokenNumSignalSize = static_cast<size_t>(config.worldSize / config.gpuPerNode) *
+                                  config.numQpPerPe * sizeof(uint64_t);
+  if (config.kernelType == KernelType::InterNodeV2LL) {
+    // Dispatch and Combine use independent monotonic-generation signal slots.
+    nodeTokenNumSignalSize *= 2;
+  }
   nodeRecvTokenNumMemObj =
       ShmemMallocAndReturnMemObjPtr(nodeTokenNumSignalSize, hipDeviceMallocUncached);
 }
@@ -371,7 +507,12 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&localPeTokenCounter, config.worldSize * sizeof(index_t)));
   HIP_RUNTIME_CHECK(hipMemset(localPeTokenCounter, 0, config.worldSize * sizeof(index_t)));
 
-  dispTokOffsetMemObj = ShmemMallocAndReturnMemObjPtr(sizeof(index_t), hipDeviceMallocUncached);
+  size_t dispTokOffsetSize = sizeof(index_t);
+  if (IsInterNodeV2DirectType(config.kernelType)) {
+    dispTokOffsetSize = static_cast<size_t>(config.numExpertPerRank) * sizeof(index_t);
+  }
+  dispTokOffsetMemObj =
+      ShmemMallocAndReturnMemObjPtr(dispTokOffsetSize, hipDeviceMallocUncached);
   dispTokIdToSrcTokIdMemObj =
       ShmemMallocAndReturnMemObjPtr(maxNumOutToken * sizeof(index_t), hipDeviceMallocUncached);
 
@@ -400,8 +541,12 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipMalloc(&dispTokToEpSlotMap, mapSize));
   HIP_RUNTIME_CHECK(hipMemset(dispTokToEpSlotMap, 0, mapSize));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&standardPackedRecvCount, config.numExpertPerRank * sizeof(int)));
-  HIP_RUNTIME_CHECK(hipMemset(standardPackedRecvCount, 0, config.numExpertPerRank * sizeof(int)));
+  if (IsInterNodeV2DirectType(config.kernelType)) {
+    standardPackedRecvCount = dispTokOffsetMemObj->template GetAs<int*>();
+  } else {
+    HIP_RUNTIME_CHECK(hipMalloc(&standardPackedRecvCount, config.numExpertPerRank * sizeof(int)));
+    HIP_RUNTIME_CHECK(hipMemset(standardPackedRecvCount, 0, config.numExpertPerRank * sizeof(int)));
+  }
 #endif
 }
 
@@ -421,19 +566,22 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
   HIP_RUNTIME_CHECK(hipFree(interNodeDispSendMap));
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   HIP_RUNTIME_CHECK(hipFree(dispTokToEpSlotMap));
-  HIP_RUNTIME_CHECK(hipFree(standardPackedRecvCount));
+  if (!IsInterNodeV2DirectType(config.kernelType))
+    HIP_RUNTIME_CHECK(hipFree(standardPackedRecvCount));
 #endif
 }
 
 void EpDispatchCombineHandle::InitializeBarrier() {
-  size_t barrierSize = config.worldSize * sizeof(uint32_t);
+  const size_t barrierWords =
+      std::max({static_cast<size_t>(config.worldSize),
+                kV2LLControlBarrierWords});
+  const size_t barrierSize = barrierWords * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&combineGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(combineGridBarrier, 0, barrierSize));
   HIP_RUNTIME_CHECK(hipMalloc(&crossDeviceBarrierFlag, sizeof(uint64_t)));
-  crossDeviceBarrierFlag[0] = ((config.kernelType == KernelType::InterNodeV1) ||
-                               (config.kernelType == KernelType::InterNodeV1LL) ||
+  crossDeviceBarrierFlag[0] = (IsInterNodeV1BufferType(config.kernelType) ||
                                (config.kernelType == KernelType::AsyncLL))
                                   ? 0
                                   : 1;
@@ -448,8 +596,11 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeChunkFlagCombine, interNodeChunkFlagSize));
   HIP_RUNTIME_CHECK(hipMemset(interNodeChunkFlagCombine, 0, interNodeChunkFlagSize));
 
-  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier, 4 * sizeof(index_t)));
-  HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0, 4 * sizeof(index_t)));
+  constexpr size_t kInterNodeBarrierWords = 2;
+  HIP_RUNTIME_CHECK(hipMalloc(&interNodeBlocksBarrier,
+                              kInterNodeBarrierWords * sizeof(index_t)));
+  HIP_RUNTIME_CHECK(hipMemset(interNodeBlocksBarrier, 0,
+                              kInterNodeBarrierWords * sizeof(index_t)));
 }
 
 void EpDispatchCombineHandle::FinalizeBarrier() {
@@ -472,6 +623,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   EpDispatchCombineArgsRaw args;
   args.config = handle.config;
   args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;
+  args.v2DispatchElemSize = handle.v2DispatchElemSize;
   args.rdmaBlockNum = rdmaBlockNum;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
@@ -484,8 +636,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   if (handle.config.kernelType == KernelType::IntraNode ||
       handle.config.kernelType == KernelType::IntraNodeLL) {
     args.intraNodeTokBufs = std::get<ShmemBufsIntraNode>(handle.shmemTokBufs);
-  } else if (handle.config.kernelType == KernelType::InterNodeV1 ||
-             handle.config.kernelType == KernelType::InterNodeV1LL) {
+  } else if (IsInterNodeV1BufferType(handle.config.kernelType)) {
     args.interNodeV1TokBufs = std::get<ShmemBufsInterNodeV1>(handle.shmemTokBufs);
   } else {
     args.interNodeTokBufs = std::get<ShmemBufsInterNode>(handle.shmemTokBufs);
@@ -505,7 +656,12 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.dispReceiverIdxMap = handle.dispReceiverIdxMap;
   args.dispSenderIdxMap = handle.dispSenderIdxMap;
   args.destPeTokenIdxMap = handle.destPeTokenIdxMap;
-  args.srcPeTokenIdxMap = handle.srcPeTokenIdxMap;
+  // V2 direct kernels do not use the legacy srcPeTokenIdxMap. Reuse that existing ABI slot for
+  // the host-side local address of the symmetric packed-count allocation; the GPU SymmMemObj's
+  // implicit localPtr alias is not reliable on nonzero nodes.
+  args.srcPeTokenIdxMap = IsInterNodeV2DirectType(handle.config.kernelType)
+                              ? handle.dispTokOffsetMemObj->template GetAs<index_t*>()
+                              : handle.srcPeTokenIdxMap;
   args.dispTokOffsetMemObj = handle.dispTokOffsetMemObj;
   args.dispTokIdToSrcTokIdMemObj = handle.dispTokIdToSrcTokIdMemObj;
   args.dispDestTokIdMap = handle.dispDestTokIdMap;

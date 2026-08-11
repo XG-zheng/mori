@@ -124,35 +124,6 @@
 namespace mori {
 namespace moe {
 
-struct ConvertDispatchOutputArgs {
-  EpDispatchCombineConfig config;
-  const void* dispatchOutX{nullptr};
-  const void* dispatchOutTopkIdx{nullptr};
-  const index_t* dispatchSrcTokenPos{nullptr};
-  const index_t* totalRecvTokenNum{nullptr};
-  uint32_t* dispatchGridBarrier{nullptr};
-  void* packedRecvX{nullptr};
-  int* packedRecvCount{nullptr};
-  int* packedRecvSrcInfo{nullptr};
-  int64_t* packedRecvLayoutRange{nullptr};
-  uint64_t* dispTokToEpSlotMap{nullptr};
-};
-
-struct ConvertCombineInputArgs {
-  EpDispatchCombineConfig config;
-  const void* packedRecvX{nullptr};
-  const void* topkIdx{nullptr};
-  const void* topkWeights{nullptr};
-  const void* packedRecvSrcInfo{nullptr};
-  const void* packedRecvLayoutRange{nullptr};
-  const index_t* totalRecvTokenNum{nullptr};
-  void* combineInput{nullptr};
-  uint64_t* dispTokToEpSlotMap{nullptr};
-  int* packedRecvCount{nullptr};
-  mori::application::SymmMemObjPtr shmemCombineInpTokMemObj;
-  mori::application::SymmMemObjPtr dispTokIdToSrcTokIdMemObj;
-};
-
 // Grid barrier: synchronize all blocks within a grid
 // All threads in all blocks must call this function
 template <typename T>
@@ -172,6 +143,8 @@ __device__ inline void GridBarrier(T* barrierPtr) {
   __syncthreads();
 }
 
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+
 // Forward declarations
 template <bool IsStandalone>
 __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs args);
@@ -187,17 +160,20 @@ __device__ inline void InvokeConvertDispatchOutput(const EpDispatchCombineArgs<T
   if (args.config.kernelType == KernelType::IntraNode ||
       args.config.kernelType == KernelType::IntraNodeLL) {
     convArgs.dispatchOutX = args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(myPe);
-  } else if (args.config.kernelType == KernelType::InterNodeV1 ||
-             args.config.kernelType == KernelType::InterNodeV1LL) {
+  } else if (IsInterNodeV1BufferType(args.config.kernelType)) {
     convArgs.dispatchOutX = args.interNodeV1TokBufs.dispatchOut->template GetAs<T*>(myPe);
   } else {
     convArgs.dispatchOutX = args.interNodeTokBufs.dispatchOut->template GetAs<T*>(myPe);
   }
+  convArgs.dispatchOutElemSize = sizeof(T);
+  convArgs.dispatchOutScales = nullptr;
+  convArgs.dispatchOutScaleBytesPerToken = 0;
   convArgs.dispatchOutTopkIdx = args.shmemOutIndicesMemObj->template GetAs<index_t*>(myPe);
   convArgs.dispatchSrcTokenPos = args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(myPe);
   convArgs.totalRecvTokenNum = args.totalRecvTokenNum;
   convArgs.dispatchGridBarrier = args.dispatchGridBarrier;
   convArgs.packedRecvX = args.standardPackedRecvX;
+  convArgs.packedRecvScales = nullptr;
   convArgs.packedRecvCount = args.standardPackedRecvCount;
   convArgs.packedRecvSrcInfo = args.standardPackedRecvSrcInfo;
   convArgs.packedRecvLayoutRange = args.standardPackedRecvLayoutRange;
@@ -222,8 +198,7 @@ __device__ inline void InvokeConvertCombineInput(const EpDispatchCombineArgs<T>&
   if (args.config.kernelType == KernelType::IntraNode ||
       args.config.kernelType == KernelType::IntraNodeLL) {
     convArgs.shmemCombineInpTokMemObj = args.intraNodeTokBufs.combineInp;
-  } else if (args.config.kernelType == KernelType::InterNodeV1 ||
-             args.config.kernelType == KernelType::InterNodeV1LL) {
+  } else if (IsInterNodeV1BufferType(args.config.kernelType)) {
     convArgs.shmemCombineInpTokMemObj = args.interNodeV1TokBufs.combineInp;
   } else {
     convArgs.shmemCombineInpTokMemObj = args.interNodeTokBufs.combineInp;
@@ -254,11 +229,12 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
   const int64_t maxNumTokenPerRank = config.maxNumInpTokenPerRank;
   const int64_t maxTokensPerExpert =
       static_cast<int64_t>(config.worldSize) * config.maxNumInpTokenPerRank;
-  const size_t hiddenBytes = config.HiddenDimSz() * config.maxTokenTypeSize;
+  const size_t hiddenBytes = config.HiddenDimSz() * args.dispatchOutElemSize;
 
   const auto* topkIdx = reinterpret_cast<const index_t*>(args.dispatchOutTopkIdx);
   const auto* dispatchSrcTokenPos = args.dispatchSrcTokenPos;
   auto* packedRecvX = reinterpret_cast<uint8_t*>(args.packedRecvX);
+  auto* packedRecvScales = reinterpret_cast<uint8_t*>(args.packedRecvScales);
   auto* packedRecvSrcInfo = args.packedRecvSrcInfo;
   auto* packedRecvCount = args.packedRecvCount;
   (void)args.packedRecvLayoutRange;
@@ -308,6 +284,14 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
     const auto* srcBytes = reinterpret_cast<const uint8_t*>(args.dispatchOutX) + srcOffset;
     auto* dstBytes = packedRecvX + dstOffset;
     core::WarpCopy<uint8_t, 7>(dstBytes, srcBytes, hiddenBytes);
+    if (packedRecvScales != nullptr && args.dispatchOutScales != nullptr &&
+        args.dispatchOutScaleBytesPerToken > 0) {
+      const size_t scaleBytes = args.dispatchOutScaleBytesPerToken;
+      const auto* srcScales = reinterpret_cast<const uint8_t*>(args.dispatchOutScales) +
+                              static_cast<size_t>(tokenIdx) * scaleBytes;
+      auto* dstScales = packedRecvScales + static_cast<size_t>(linearIndex) * scaleBytes;
+      core::WarpCopy<uint8_t, 7>(dstScales, srcScales, scaleBytes);
+    }
     PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId);
   }
 
@@ -334,11 +318,12 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
 
   const int64_t maxTokensPerExpert =
       static_cast<int64_t>(config.worldSize) * config.maxNumInpTokenPerRank;
-  const size_t hiddenBytes = config.HiddenDimSz() * config.maxTokenTypeSize;
+  const size_t hiddenBytes = config.HiddenDimSz() * args.dispatchOutElemSize;
 
   const auto* topkIdx = reinterpret_cast<const index_t*>(args.dispatchOutTopkIdx);
   const auto* dispatchSrcTokenPos = args.dispatchSrcTokenPos;
   auto* packedRecvX = reinterpret_cast<uint8_t*>(args.packedRecvX);
+  auto* packedRecvScales = reinterpret_cast<uint8_t*>(args.packedRecvScales);
   auto* packedRecvSrcInfo = args.packedRecvSrcInfo;
   auto* packedRecvCount = args.packedRecvCount;
   (void)args.packedRecvLayoutRange;
@@ -410,6 +395,14 @@ __device__ inline void ConvertDispatchOutputDevice(ConvertDispatchOutputArgs arg
     const auto* srcBytes = reinterpret_cast<const uint8_t*>(args.dispatchOutX) + srcOffset;
     auto* dstBytes = packedRecvX + dstOffset;
     core::WarpCopy<uint8_t, 7>(dstBytes, srcBytes, hiddenBytes);
+    if (packedRecvScales != nullptr && args.dispatchOutScales != nullptr &&
+        args.dispatchOutScaleBytesPerToken > 0) {
+      const size_t scaleBytes = args.dispatchOutScaleBytesPerToken;
+      const auto* srcScales = reinterpret_cast<const uint8_t*>(args.dispatchOutScales) +
+                              static_cast<size_t>(tokenIdx) * scaleBytes;
+      auto* dstScales = packedRecvScales + static_cast<size_t>(linearIndex) * scaleBytes;
+      core::WarpCopy<uint8_t, 7>(dstScales, srcScales, scaleBytes);
+    }
 
     PROFILE_DISPATCH_RECORD(ts, tsCount, kTsMax, laneId);
   }
@@ -589,6 +582,8 @@ template <typename T, bool UseP2PRead = true>
 __global__ void ConvertCombineInputKernel(ConvertCombineInputArgs args) {
   ConvertCombineInputKernel_body<T, UseP2PRead>(args);
 }
+
+#endif  // ENABLE_STANDARD_MOE_ADAPT
 
 }  // namespace moe
 }  // namespace mori

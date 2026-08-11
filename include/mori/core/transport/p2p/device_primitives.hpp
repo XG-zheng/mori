@@ -547,22 +547,31 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   const size_t laneOffset = laneId * vecSize;
 
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
+  float scales[AccumNum];
+  const T* cachedSrcs[AccumNum];
+#pragma unroll AccumNum
+  for (int i = 0; i < AccumNum; ++i) {
+    scales[i] = (srcScales == nullptr) ? 1.0f : srcScales[i];
+    cachedSrcs[i] = srcs[i];
+  }
 
   for (size_t iter = 0; iter < numIters; iter++) {
-    AccumFp32Type accumValFp32[Unroll][vecSize] = {0};
+    // HIP's float2 has an explicit scalar constructor, so `{0}` is ill-formed for FP4 while
+    // value-initialization correctly zeros both scalar and vector accumulator types.
+    AccumFp32Type accumValFp32[Unroll][vecSize] = {};
 
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
-      const T* srcPtr = srcs[i];
+      const T* srcPtr = cachedSrcs[i];
       if (srcPtr == nullptr) continue;
 
 #pragma unroll Unroll
       for (int u = 0; u < Unroll; u++) {
         DataType srcVals = load<VecBytes>(srcPtr + offset + laneOffset + u * warpSize * vecSize);
-        float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          accumValFp32[u][j] +=
+              AccumFp32Type(reinterpret_cast<const T*>(&srcVals)[j]) * scales[i];
         }
       }
     }
@@ -732,10 +741,10 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
   const int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;
 
-  // WarpAccumImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems);
-  // WarpAccumImpl<T, VecBytes, AccumNum, 1>(dest, srcs, srcScales, offset, nelems);
-
-  WarpAccumImpl<T, VecBytes, AccumNum>(dest, srcs, srcScales, offset, nelems);
+  WarpAccumImpl<T, VecBytes, AccumNum, Unroll>(dest, srcs, srcScales, offset, nelems);
+  if constexpr (Unroll > 1) {
+    WarpAccumImpl<T, VecBytes, AccumNum, 1>(dest, srcs, srcScales, offset, nelems);
+  }
 
   // remaining size
 

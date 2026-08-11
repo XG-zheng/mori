@@ -67,9 +67,10 @@ void PrepareInferenceArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t in
 }
 
 int64_t BuildArgs(mori::moe::EpDispatchCombineHandle& handle, int rdmaBlockNum, int hiddenDim,
-                  int useExternalInpBuf) {
+                  int useExternalInpBuf, int dispatchCopyBlockNum) {
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum);
+  args.dispatchCopyBlockNum = dispatchCopyBlockNum;
   // Runtime hidden_dim: dispatch/combine (send) calls pass hiddenDim from input tensor,
   // recv calls leave it as -1 and reuse the value cached by the prior send call.
   if (hiddenDim > 0) {
@@ -91,7 +92,8 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
                              int64_t disp_dest_tok_id_map_ptr,
                              int64_t inter_node_disp_dest_tok_id_map_ptr,
                              int64_t inter_node_disp_send_map_ptr, int64_t total_recv_token_num_ptr,
-                             int64_t disp_tok_id_to_src_tok_id_local_ptr) {
+                             int64_t disp_tok_id_to_src_tok_id_local_ptr,
+                             int dispatchCopyBlockNum) {
   mori::moe::EpDispatchCombineRoutingPtrs routing;
   routing.dispDestTokIdMap = reinterpret_cast<mori::moe::index_t*>(disp_dest_tok_id_map_ptr);
   routing.interNodeDispDestTokIdMap =
@@ -105,6 +107,7 @@ int64_t BuildArgsWithRouting(mori::moe::EpDispatchCombineHandle& handle, int rdm
 
   thread_local mori::moe::EpDispatchCombineArgsRaw args;
   args = mori::moe::GetEpDispatchCombineArgsRaw(handle, rdmaBlockNum, &routing, replayMode);
+  args.dispatchCopyBlockNum = dispatchCopyBlockNum;
   if (hiddenDim > 0) {
     args.config.hiddenDim = hiddenDim;
     handle.curHiddenDim = hiddenDim;
@@ -133,11 +136,11 @@ void SnapshotDispTokIdToSrcTokIdLocal(mori::moe::EpDispatchCombineHandle& handle
 // Backward-compatible helper for call sites that still want a merged API.
 int64_t PrepareAndBuildArgs(mori::moe::EpDispatchCombineHandle& handle, int64_t input_ptr,
                             int input_dtype, int64_t num_tokens, int64_t weight_ptr,
-                            int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum, int hiddenDim,
-                            int useExternalInpBuf) {
+                            int64_t scale_ptr, int64_t indices_ptr, int rdmaBlockNum,
+                            int hiddenDim, int useExternalInpBuf, int dispatchCopyBlockNum) {
   PrepareInferenceArgs(handle, input_ptr, input_dtype, num_tokens, weight_ptr, scale_ptr,
                        indices_ptr);
-  return BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf);
+  return BuildArgs(handle, rdmaBlockNum, hiddenDim, useExternalInpBuf, dispatchCopyBlockNum);
 }
 
 py::tuple GetDispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle, bool has_scales) {
@@ -194,17 +197,25 @@ void SetStandardMoeOutputBuffers(mori::moe::EpDispatchCombineHandle& handle,
 int64_t BuildConvertDispatchOutputArgs(mori::moe::EpDispatchCombineHandle& handle,
                                        int64_t dispatchOutX_ptr, int64_t dispatchOutTopkIdx_ptr,
                                        int64_t packedRecvX_ptr, int64_t packedRecvSrcInfo_ptr,
-                                       int hiddenDim) {
+                                       int hiddenDim, int dispatchOutElemSize,
+                                       int64_t dispatchOutScales_ptr,
+                                       int64_t packedRecvScales_ptr,
+                                       int dispatchOutScaleBytesPerToken) {
   auto* args = new mori::moe::ConvertDispatchOutputArgs{};
   args->config = handle.config;
   if (hiddenDim > 0) args->config.hiddenDim = hiddenDim;
   args->dispatchOutX = reinterpret_cast<void*>(dispatchOutX_ptr);
+  args->dispatchOutElemSize = static_cast<size_t>(dispatchOutElemSize);
+  args->dispatchOutScales = reinterpret_cast<void*>(dispatchOutScales_ptr);
+  args->dispatchOutScaleBytesPerToken =
+      static_cast<size_t>(dispatchOutScaleBytesPerToken);
   args->dispatchOutTopkIdx = reinterpret_cast<void*>(dispatchOutTopkIdx_ptr);
   args->dispatchSrcTokenPos =
       handle.dispTokIdToSrcTokIdMemObj->template GetAs<mori::moe::index_t*>();
   args->totalRecvTokenNum = handle.totalRecvTokenNum;
   args->dispatchGridBarrier = handle.dispatchGridBarrier;
   args->packedRecvX = reinterpret_cast<void*>(packedRecvX_ptr);
+  args->packedRecvScales = reinterpret_cast<void*>(packedRecvScales_ptr);
   args->packedRecvCount = handle.standardPackedRecvCount;
   args->packedRecvSrcInfo = reinterpret_cast<int*>(packedRecvSrcInfo_ptr);
   args->packedRecvLayoutRange = nullptr;
@@ -246,6 +257,19 @@ int64_t GetCombineInputPtr(mori::moe::EpDispatchCombineHandle& handle) {
 void LaunchReset(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
   handle.LaunchReset(reinterpret_cast<hipStream_t>(stream));
 }
+
+void BeginV2Dispatch(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
+  handle.BeginV2Dispatch(reinterpret_cast<hipStream_t>(stream));
+}
+void CommitV2Dispatch(mori::moe::EpDispatchCombineHandle& handle) {
+  handle.CommitV2Dispatch();
+}
+void AbortV2Dispatch(mori::moe::EpDispatchCombineHandle& handle) { handle.AbortV2Dispatch(); }
+void BeginV2Combine(mori::moe::EpDispatchCombineHandle& handle, int64_t stream) {
+  handle.BeginV2Combine(reinterpret_cast<hipStream_t>(stream));
+}
+void CommitV2Combine(mori::moe::EpDispatchCombineHandle& handle) { handle.CommitV2Combine(); }
+void AbortV2Combine(mori::moe::EpDispatchCombineHandle& handle) { handle.AbortV2Combine(); }
 
 void PyLaunchLocalExpertCount(const mori::moe::EpDispatchCombineConfig& config, int64_t indices_ptr,
                               int64_t total_recv_token_num_ptr, int64_t local_expert_count_ptr,
@@ -289,6 +313,41 @@ py::tuple GetRegisteredCombineInputBuffer(mori::moe::EpDispatchCombineHandle& ha
                         static_cast<int64_t>(actual));
 }
 
+py::tuple GetV2DispatchOutputPtrs(mori::moe::EpDispatchCombineHandle& handle) {
+  if (!mori::moe::IsInterNodeV2DirectType(handle.config.kernelType)) {
+    throw std::runtime_error("V2 expert-major output buffers require InterNodeV2LL");
+  }
+  auto dispatchOut = handle.GetShmemDispatchOutTokMemObj();
+  const int64_t scalePtr = handle.shmemOutScalesMemObj.IsValid()
+                               ? reinterpret_cast<int64_t>(handle.shmemOutScalesMemObj->Get())
+                               : 0;
+  return py::make_tuple(
+      reinterpret_cast<int64_t>(dispatchOut->Get()),
+      reinterpret_cast<int64_t>(handle.dispTokOffsetMemObj->Get(handle.config.rank)),
+      reinterpret_cast<int64_t>(handle.shmemDispatchOutWeightsMemObj->Get()), scalePtr,
+      reinterpret_cast<int64_t>(handle.dispTokIdToSrcTokIdMemObj->Get()),
+      static_cast<int64_t>(handle.config.V2MaxTokensPerExpert()));
+}
+
+int64_t GetV2TokenMajorIndicesPtr(mori::moe::EpDispatchCombineHandle& handle) {
+  if (!mori::moe::IsInterNodeV2DirectType(handle.config.kernelType)) {
+    throw std::runtime_error("V2 token-major output buffers require InterNodeV2LL");
+  }
+  return reinterpret_cast<int64_t>(handle.shmemOutIndicesMemObj->Get());
+}
+
+py::tuple GetV2CombineInputBuffer(mori::moe::EpDispatchCombineHandle& handle,
+                                  int hidden_dim = -1) {
+  if (!mori::moe::IsInterNodeV2DirectType(handle.config.kernelType)) {
+    throw std::runtime_error("V2 expert-major combine input requires InterNodeV2LL");
+  }
+  const int actual = (hidden_dim > 0) ? hidden_dim : static_cast<int>(handle.config.hiddenDim);
+  return py::make_tuple(
+      reinterpret_cast<int64_t>(handle.GetShmemCombineInpTokMemObj()->Get()),
+      static_cast<int64_t>(handle.config.numExpertPerRank),
+      static_cast<int64_t>(handle.config.V2MaxTokensPerExpert()), static_cast<int64_t>(actual));
+}
+
 #ifdef ENABLE_PROFILER
 py::tuple GetDebugTimeBuf(mori::moe::EpDispatchCombineHandle& handle) {
   return py::make_tuple(reinterpret_cast<int64_t>(handle.profilerConfig.debugTimeBuf),
@@ -315,19 +374,21 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
         py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
         py::arg("indices_ptr"));
   m.def("build_args", &BuildArgs, py::arg("handle"), py::arg("rdma_block_num") = -1,
-        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1);
+        py::arg("hidden_dim") = -1, py::arg("use_external_inp_buf") = -1,
+        py::arg("dispatch_copy_block_num") = 0);
   m.def("build_args_with_routing", &BuildArgsWithRouting, py::arg("handle"),
         py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
         py::arg("use_external_inp_buf") = -1, py::arg("replay_mode") = false,
         py::arg("disp_dest_tok_id_map_ptr"), py::arg("inter_node_disp_dest_tok_id_map_ptr"),
         py::arg("inter_node_disp_send_map_ptr"), py::arg("total_recv_token_num_ptr"),
-        py::arg("disp_tok_id_to_src_tok_id_local_ptr"));
+        py::arg("disp_tok_id_to_src_tok_id_local_ptr"),
+        py::arg("dispatch_copy_block_num") = 0);
   m.def("snapshot_disp_tok_id_to_src_tok_id_local", &SnapshotDispTokIdToSrcTokIdLocal,
         py::arg("handle"), py::arg("dst_ptr"), py::arg("stream") = 0);
   m.def("prepare_and_build_args", &PrepareAndBuildArgs, py::arg("handle"), py::arg("inp_ptr"),
         py::arg("dtype"), py::arg("num_tokens"), py::arg("weight_ptr"), py::arg("scale_ptr"),
         py::arg("indices_ptr"), py::arg("rdma_block_num") = -1, py::arg("hidden_dim") = -1,
-        py::arg("use_external_inp_buf") = -1);
+        py::arg("use_external_inp_buf") = -1, py::arg("dispatch_copy_block_num") = 0);
 
 #ifdef ENABLE_STANDARD_MOE_ADAPT
   m.def("set_standard_moe_output_buffers", &SetStandardMoeOutputBuffers);
@@ -339,12 +400,23 @@ void DeclareEpDispatchCombineHandle(pybind11::module& m) {
 #endif
 
   m.def("launch_reset", &LaunchReset);
+  m.def("begin_v2_dispatch", &BeginV2Dispatch);
+  m.def("commit_v2_dispatch", &CommitV2Dispatch);
+  m.def("abort_v2_dispatch", &AbortV2Dispatch);
+  m.def("begin_v2_combine", &BeginV2Combine);
+  m.def("commit_v2_combine", &CommitV2Combine);
+  m.def("abort_v2_combine", &AbortV2Combine);
 
   m.def("get_cur_rank_num_token", &mori::moe::EpDispatchCombineHandle::GetCurRankNumToken);
   m.def("get_dispatch_src_token_pos", &GetDispatchSrcTokenId);
   m.def("get_dispatch_sender_token_idx_map", &GetDispatchSenderTokenIdxMap);
   m.def("get_dispatch_receiver_token_idx_map", &GetDispatchReceiverTokenIdxMap);
   m.def("get_registered_combine_input_buffer", &GetRegisteredCombineInputBuffer, py::arg("handle"),
+        py::arg("hidden_dim") = -1);
+  m.def("get_v2_dispatch_output_ptrs", &GetV2DispatchOutputPtrs, py::arg("handle"));
+  m.def("get_v2_token_major_indices_ptr", &GetV2TokenMajorIndicesPtr,
+        py::arg("handle"));
+  m.def("get_v2_combine_input_buffer", &GetV2CombineInputBuffer, py::arg("handle"),
         py::arg("hidden_dim") = -1);
 
 #ifdef ENABLE_PROFILER
@@ -363,6 +435,7 @@ void RegisterMoriOps(py::module_& m) {
       .value("InterNode", mori::moe::KernelType::InterNode)
       .value("InterNodeV1", mori::moe::KernelType::InterNodeV1)
       .value("InterNodeV1LL", mori::moe::KernelType::InterNodeV1LL)
+      .value("InterNodeV2LL", mori::moe::KernelType::InterNodeV2LL)
       .value("AsyncLL", mori::moe::KernelType::AsyncLL)
       .export_values();
   pybind11::enum_<mori::moe::QuantType>(m, "EpDispatchCombineQuantType")

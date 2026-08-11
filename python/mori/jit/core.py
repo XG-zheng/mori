@@ -61,6 +61,11 @@ __device__ __attribute__((visibility("default"))) GpuStates globalGpuStates;
 """
 
 
+def _genco_opt_level(kernel_name: str) -> str:
+    # V2LL is a latency-critical decode kernel and is validated with full optimization.
+    return "3" if kernel_name == "ep_internode_v2" else "2"
+
+
 class FileBaton:
     """File-based lock for multi-process build safety.
 
@@ -410,6 +415,8 @@ def _hipcc_genco(
     source: Path,
     include_dirs: list[Path],
     output: Path,
+    *,
+    opt_level: str = "2",
 ) -> None:
     """Compile a .hip source to a device code object (.hsaco) via --genco."""
     cmd = [
@@ -417,7 +424,7 @@ def _hipcc_genco(
         "--genco",
         f"--offload-arch={cfg.arch}",
         "-std=c++17",
-        "-O2",
+        f"-O{opt_level}",
         *_debuginfo_flags(),
         "-D__HIP_PLATFORM_AMD__",
         "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
@@ -443,7 +450,7 @@ _PARALLEL_KERNEL_GROUPS: dict[str, list[str]] = {
 
 def _compile_one_genco(args: tuple) -> str:
     """Worker for parallel genco compilation."""
-    kernel_name, arch, rocm_path, hipcc, include_dirs_str, output_path = args
+    kernel_name, arch, rocm_path, hipcc, include_dirs_str, output_path, opt_level = args
     cfg_local = BuildConfig(
         arch=arch,
         rocm_path=rocm_path,
@@ -454,7 +461,9 @@ def _compile_one_genco(args: tuple) -> str:
     mori_root = get_mori_source_root()
     source = mori_root / "src" / "ops" / "kernels" / f"{kernel_name}.hip"
     include_dirs = [Path(p) for p in include_dirs_str]
-    _hipcc_genco(cfg_local, source, include_dirs, Path(output_path))
+    _hipcc_genco(
+        cfg_local, source, include_dirs, Path(output_path), opt_level=opt_level
+    )
     return output_path
 
 
@@ -508,8 +517,14 @@ def compile_genco(
             mori_root / "src" / "ops",
             mori_root / "include" / "mori",
         ]
+        opt_level = _genco_opt_level(kernel_name)
         cache_dir = get_cache_dir(
-            cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe
+            cfg.arch,
+            source_paths,
+            nic,
+            profiler=profiler,
+            ccqe=ccqe,
+            opt_level=opt_level,
         )
 
         hsaco_paths = [cache_dir / f"{k}.hsaco" for k in sub_kernels]
@@ -536,6 +551,7 @@ def compile_genco(
                     cfg.hipcc,
                     include_strs,
                     str(cache_dir / f"{k}.hsaco"),
+                    _genco_opt_level(k),
                 )
                 for k in sub_kernels
             ]
@@ -559,7 +575,15 @@ def compile_genco(
     # subsystem source tree; hashing only the top-level .hip reuses a stale
     # .hsaco when an included file changes.
     source_paths = [(mori_root / source_dir).parent, mori_root / "include" / "mori"]
-    cache_dir = get_cache_dir(cfg.arch, source_paths, nic, profiler=profiler, ccqe=ccqe)
+    opt_level = _genco_opt_level(kernel_name)
+    cache_dir = get_cache_dir(
+        cfg.arch,
+        source_paths,
+        nic,
+        profiler=profiler,
+        ccqe=ccqe,
+        opt_level=opt_level,
+    )
     hsaco_path = cache_dir / f"{kernel_name}.hsaco"
 
     if hsaco_path.is_file():
@@ -577,7 +601,7 @@ def compile_genco(
             f"[mori-jit] Compiling {kernel_name} for {cfg.arch} "
             f"(nic={nic}, ccqe={ccqe}, profiler={profiler}) ..."
         )
-        _hipcc_genco(cfg, source, include_dirs, hsaco_path)
+        _hipcc_genco(cfg, source, include_dirs, hsaco_path, opt_level=opt_level)
         print(f"[mori-jit]   Cached: {hsaco_path}")
         _update_latest_symlink(hsaco_path)
 

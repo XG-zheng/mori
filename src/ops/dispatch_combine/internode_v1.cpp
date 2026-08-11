@@ -739,20 +739,29 @@ inline __device__ void CombineSync(EpDispatchCombineArgs<T>& args) {
   int tokenPerBlock = core::CeilDiv(totalRecvTokenNum, blockNum);
   int startTokenIdx = blockId * tokenPerBlock;
   int endTokenIdx = std::min(startTokenIdx + tokenPerBlock, totalRecvTokenNum);
-#ifndef ENABLE_STANDARD_MOE_ADAPT
-  for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
-    if (args.config.quantType == QuantType::Fp8DirectCast) {
-      using Fp8T = core::CombineInternalFp8;
-      Fp8T* dst = args.interNodeV1TokBufs.combineInp->template GetAs<Fp8T*>();
-      const T* src = args.inpTokenBuf;
-      const size_t base = tokenId * hiddenDim;
-      core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, hiddenDim, laneId);
-    } else {
-      core::WarpCopy(args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + tokenId * hiddenDim,
-                     args.inpTokenBuf + tokenId * hiddenDim, hiddenDim);
+  bool stageExternalInput = args.config.useExternalInpBuffer;
+#ifdef ENABLE_STANDARD_MOE_ADAPT
+  // The fused Standard-MoE kernel converts expert-major GEMM output directly into combineInp.
+  // Standalone ConvertCombineInput can use the same zero-copy path by setting
+  // useExternalInpBuffer=false. Normal callers with an external input still require staging even
+  // when the adapter feature is compiled in.
+  stageExternalInput = stageExternalInput && !args.enableStandardMoeOutput;
+#endif
+  if (stageExternalInput) {
+    for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
+      if (args.config.quantType == QuantType::Fp8DirectCast) {
+        using Fp8T = core::CombineInternalFp8;
+        Fp8T* dst = args.interNodeV1TokBufs.combineInp->template GetAs<Fp8T*>();
+        const T* src = args.inpTokenBuf;
+        const size_t base = tokenId * hiddenDim;
+        core::WarpCastBf16ToCombineInternalFp8<T>(dst + base, src + base, hiddenDim, laneId);
+      } else {
+        core::WarpCopy(
+            args.interNodeV1TokBufs.combineInp->template GetAs<T*>() + tokenId * hiddenDim,
+            args.inpTokenBuf + tokenId * hiddenDim, hiddenDim);
+      }
     }
   }
-#endif
   if (args.weightsBuf) {
     for (int tokenId = startTokenIdx + warpId; tokenId < endTokenIdx; tokenId += warpNum) {
       core::WarpCopy(

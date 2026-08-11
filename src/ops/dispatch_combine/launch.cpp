@@ -465,6 +465,32 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
       reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
                  stream, &args, args_size);
       break;
+    case KernelType::InterNodeV2LL:
+      if (wpb < handle.config.numQpPerPe) {
+        throw std::runtime_error(
+            "InterNodeV2LL Dispatch requires at least one sender warp per QP");
+      }
+      args.dispatchCopyBlockNum =
+          std::max(handle.config.numQpPerPe, bn / 4);
+      if (bn - args.dispatchCopyBlockNum <
+          handle.config.worldSize / handle.config.gpuPerNode) {
+        throw std::runtime_error(
+            "InterNodeV2LL requires at least one scatter CTA per node");
+      }
+      if (bn > handle.multiProcessorCount) {
+        throw std::runtime_error(
+            "fused InterNodeV2LL block count exceeds the conservative resident-CU limit");
+      }
+      handle.BeginV2Dispatch(stream);
+      try {
+        reg.Launch(std::string("EpDispatchInterNodeV2LLKernel_") + sfx + "_ring", bn, block_x,
+                   0, stream, &args, args_size);
+        handle.CommitV2Dispatch();
+      } catch (...) {
+        handle.AbortV2Dispatch();
+        throw;
+      }
+      break;
     case KernelType::AsyncLL: {
       int mp = handle.multiProcessorCount;
       int mp_aligned = mp - (mp % handle.config.worldSize);
@@ -516,6 +542,10 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
   int smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
                                 IsBlockwiseCombineQuant(handle.config.quantType),
                                 /*use_weight_ptrs=*/true);
+  if (IsInterNodeV2DirectType(handle.config.kernelType)) {
+    const int nNodes = handle.config.worldSize / handle.config.gpuPerNode;
+    smem = combine_shared_mem(wpb, std::max(handle.config.numExpertPerToken, nNodes));
+  }
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
   auto& reg = KernelRegistry::Instance();
@@ -594,6 +624,29 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
       reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
                  stream, &args, args_size);
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
+      break;
+    case KernelType::InterNodeV2LL:
+      if (dtype != HIP_R_16BF) {
+        throw std::runtime_error(
+            "InterNodeV2LL combine consumes BF16 Group GEMM output");
+      }
+      if (wpb < handle.config.numQpPerPe) {
+        throw std::runtime_error(
+            "InterNodeV2LL Combine requires at least one sender/waiter warp per QP");
+      }
+      handle.BeginV2Combine(stream);
+      try {
+        reg.Launch(std::string("EpCombineInterNodeV2LLRemotePartialV16_") + sfx, bn, block_x,
+                   smem, stream, &args, args_size);
+        reg.Launch(std::string("EpCombineInterNodeV2LLSendLocalV16_") + sfx, bn, block_x, smem,
+                   stream, &args, args_size);
+        reg.Launch(std::string("EpCombineInterNodeV2LLFinalize_") + sfx, bn, block_x, smem, stream,
+                   &args, args_size);
+        handle.CommitV2Combine();
+      } catch (...) {
+        handle.AbortV2Combine();
+        throw;
+      }
       break;
     case KernelType::AsyncLL: {
       int mp = handle.multiProcessorCount;

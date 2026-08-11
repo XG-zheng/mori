@@ -59,7 +59,7 @@ if(BUILD_OPS_DEVICE)
   # Kernel sources
   set(_kernel_sources
       ep_intranode.hip ep_internode.hip ep_internode_v1.hip
-      ep_internode_v1ll.hip ep_async_ll.hip ep_local_expert_count.hip)
+      ep_internode_v1ll.hip ep_internode_v2.hip ep_async_ll.hip ep_local_expert_count.hip)
 
   # Output to build/lib/<arch>_<nic>/ (matches JIT cache layout)
   set(_arch_nic "${GPU_TARGETS}_${MORI_DEVICE_NIC}")
@@ -71,16 +71,32 @@ if(BUILD_OPS_DEVICE)
     get_filename_component(_kname ${_ksrc} NAME_WE)
     set(_hsaco_output "${_hsaco_dir}/${_kname}.hsaco")
     set(_ksrc_path "${CMAKE_SOURCE_DIR}/src/ops/kernels/${_ksrc}")
+    set(_kernel_deps ${_ksrc_path})
+    set(_kernel_opt -O2)
+    if(_ksrc STREQUAL "ep_internode_v2.hip")
+      set(_kernel_opt -O3)
+      # List the indirect include chain explicitly because Ninja cannot infer C++ preprocessor
+      # dependencies from a custom hipcc --genco command.
+      list(
+        APPEND
+        _kernel_deps
+        "${CMAKE_SOURCE_DIR}/src/ops/kernels/ep_common.hip"
+        "${CMAKE_SOURCE_DIR}/src/ops/dispatch_combine/common.hpp"
+        "${CMAKE_SOURCE_DIR}/src/ops/dispatch_combine/internode_v2.cpp"
+        "${CMAKE_SOURCE_DIR}/src/ops/dispatch_combine/internode_v2.hpp"
+        "${CMAKE_SOURCE_DIR}/include/mori/ops/dispatch_combine/dispatch_combine.hpp"
+        "${CMAKE_SOURCE_DIR}/include/mori/core/transport/p2p/device_primitives.hpp")
+    endif()
 
     add_custom_command(
       OUTPUT ${_hsaco_output}
       COMMAND
         ${HIPCC_EXECUTABLE} --genco "--offload-arch=${GPU_TARGETS}" -std=c++17
-        -O2 -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
+        ${_kernel_opt} -D__HIP_PLATFORM_AMD__ -DHIP_ENABLE_WARP_SYNC_BUILTINS ${_nic_defs}
         ${_extra_defs} -I${CMAKE_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}
         -I${CMAKE_SOURCE_DIR}/3rdparty/spdlog/include ${_mpi_includes}
         ${_ksrc_path} -o ${_hsaco_output}
-      DEPENDS ${_ksrc_path}
+      DEPENDS ${_kernel_deps}
       COMMENT "AOT compiling ${_ksrc} -> ${_arch_nic}/${_kname}.hsaco"
       VERBATIM)
     list(APPEND _all_hsaco_outputs ${_hsaco_output})

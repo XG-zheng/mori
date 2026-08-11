@@ -64,6 +64,7 @@ def get_cache_dir(
     *,
     cov: int | None = None,
     ccqe: bool = False,
+    opt_level: str | None = None,
 ) -> Path:
     """Return the cache directory for a specific arch + NIC + content combo.
 
@@ -83,9 +84,12 @@ def get_cache_dir(
     ccqe_suffix = "_ccqe" if ccqe else ""
     profiler_suffix = "_profiler" if profiler else ""
     cov_suffix = f"_cov{cov}" if cov is not None else ""
+    # O2 is the historical default. Preserve its cache path so introducing an O3-only
+    # latency kernel does not invalidate every existing MORI code object on deployment.
+    opt_suffix = "" if opt_level in (None, "2") else f"_O{opt_level}"
     d = (
         get_cache_root()
-        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}"
+        / f"{arch}_{nic}{ccqe_suffix}{profiler_suffix}{cov_suffix}{opt_suffix}"
         / content_hash
     )
     d.mkdir(parents=True, exist_ok=True)

@@ -19,9 +19,11 @@
 #include "src/ops/dispatch_combine/internode.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 #include "src/ops/dispatch_combine/intranode_ll.hpp"
+#include "src/ops/dispatch_combine/internode_v2.hpp"
 
 #define MORI_JIT_GENCO
 #include "src/ops/dispatch_combine/internode_v1.cpp"
+#include "src/ops/dispatch_combine/internode_v2.cpp"
 #include "src/ops/dispatch_combine/low_latency_async.cpp"
 #undef MORI_JIT_GENCO
 
@@ -93,6 +95,15 @@ using namespace mori::moe;
   MORI_FP8_FNUZ(WRAP_BOOL(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B)) \
   MORI_FP8_OCP(WRAP_BOOL(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B))        \
   MORI_FP4(WRAP_BOOL(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B))         \
+  WRAP_BOOL(kernel, f32##bool_suffix, float, B)
+
+// Standard-MoE conversion currently operates on scalar element types. Packed FP4 contains two
+// values per element and requires a dedicated unpack/repack implementation, so do not instantiate
+// the adapter specialization for FP4.
+#define WRAP_STANDARD_MOE_TYPES_BOOL(kernel, bool_suffix, B)                       \
+  WRAP_BOOL(kernel, bf16##bool_suffix, hip_bfloat16, B)                            \
+  MORI_FP8_FNUZ(WRAP_BOOL(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B))  \
+  MORI_FP8_OCP(WRAP_BOOL(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B))         \
   WRAP_BOOL(kernel, f32##bool_suffix, float, B)
 
 #define WRAP_BOOL3(kernel, suffix, T, B1, B2, B3)                               \

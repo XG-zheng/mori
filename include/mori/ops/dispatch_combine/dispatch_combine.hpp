@@ -25,6 +25,9 @@
 #include <hip/library_types.h>
 
 #include <cstdint>
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+#include <mutex>
+#endif
 #include <sstream>
 #include <variant>
 #include <vector>
@@ -59,8 +62,18 @@ enum KernelType {
   InterNodeV1 = 2,
   InterNodeV1LL = 3,
   AsyncLL = 4,
-  IntraNodeLL = 5
+  IntraNodeLL = 5,
+  InterNodeV2LL = 6
 };
+
+inline __host__ __device__ bool IsInterNodeV2DirectType(KernelType type) {
+  return type == KernelType::InterNodeV2LL;
+}
+
+inline __host__ __device__ bool IsInterNodeV1BufferType(KernelType type) {
+  return type == KernelType::InterNodeV1 || type == KernelType::InterNodeV1LL ||
+         IsInterNodeV2DirectType(type);
+}
 enum class QuantType { None = 0, Fp8DirectCast = 1, Fp8BlockwiseQuant = 2, Fp4BlockwiseQuant = 3 };
 
 // Blockwise combine quant types share the same staging/scale layout (per-block float scales);
@@ -155,6 +168,16 @@ struct EpDispatchCombineConfig {
 
   inline __host__ __device__ int MaxNumTokensToSend() const {
     return worldSize * MaxNumTokensToSendPerRank();
+  }
+
+  // V2 stores every (token, expert) route without destination-rank deduplication. In the worst
+  // case every source rank can route every token to the same expert.
+  inline __host__ __device__ int V2MaxTokensPerExpert() const {
+    return MaxNumTokensToSend();
+  }
+
+  inline __host__ __device__ size_t V2PackedTokenSlots() const {
+    return static_cast<size_t>(numExpertPerRank) * V2MaxTokensPerExpert();
   }
 
   inline __host__ __device__ int MaxNumTokensToRecvPerRank() const {
@@ -294,24 +317,21 @@ class EpDispatchCombineHandle {
   mori::application::SymmMemObjPtr GetShmemDispatchOutTokMemObj() const {
     if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).dispatchOut;
-    if (config.kernelType == KernelType::InterNodeV1 ||
-        config.kernelType == KernelType::InterNodeV1LL)
+    if (IsInterNodeV1BufferType(config.kernelType))
       return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).dispatchOut;
     return std::get<ShmemBufsInterNode>(shmemTokBufs).dispatchOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineOutTokMemObj() const {
     if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineOut;
-    if (config.kernelType == KernelType::InterNodeV1 ||
-        config.kernelType == KernelType::InterNodeV1LL)
+    if (IsInterNodeV1BufferType(config.kernelType))
       return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).combineOut;
     return std::get<ShmemBufsInterNode>(shmemTokBufs).combineOut;
   }
   mori::application::SymmMemObjPtr GetShmemCombineInpTokMemObj() const {
     if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL)
       return std::get<ShmemBufsIntraNode>(shmemTokBufs).combineInp;
-    if (config.kernelType == KernelType::InterNodeV1 ||
-        config.kernelType == KernelType::InterNodeV1LL)
+    if (IsInterNodeV1BufferType(config.kernelType))
       return std::get<ShmemBufsInterNodeV1>(shmemTokBufs).combineInp;
     return std::get<ShmemBufsInterNode>(shmemTokBufs).combineInp;
   }
@@ -330,9 +350,35 @@ class EpDispatchCombineHandle {
   void FinalizeBarrier();
 
  public:
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+  enum class V2LifecyclePhase : uint8_t {
+    ReadyDispatch,
+    LaunchingDispatch,
+    ReadyCombine,
+    LaunchingCombine,
+  };
+
+  void BeginV2Dispatch(hipStream_t stream);
+  void CommitV2Dispatch();
+  void AbortV2Dispatch();
+  void BeginV2Combine(hipStream_t stream);
+  void CommitV2Combine();
+  void AbortV2Combine();
+#endif
+
   // Updated at each round of inference
   index_t curRankNumToken{0};
   int curHiddenDim{-1};
+  // V2 retains the raw Dispatch packet through Combine. Dispatch and Combine can use different
+  // element types, so Combine must not infer this packet stride from its own template type.
+  size_t v2DispatchElemSize{0};
+
+#if !defined(__HIPCC__) && !defined(__CUDACC__)
+  std::mutex v2LifecycleMutex;
+  V2LifecyclePhase v2LifecyclePhase{V2LifecyclePhase::ReadyDispatch};
+  hipStream_t v2LifecycleStream{nullptr};
+  bool v2LifecycleStreamBound{false};
+#endif
 
   index_t multiProcessorCount{0};
   index_t maxThreads{0};
@@ -444,7 +490,9 @@ struct EpDispatchCombineArgs {
   using data_type = T;
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
+  size_t v2DispatchElemSize{0};
   int rdmaBlockNum{-1};
+  int dispatchCopyBlockNum{0};
   bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
@@ -509,7 +557,9 @@ struct EpDispatchCombineArgs {
 struct EpDispatchCombineArgsRaw {
   EpDispatchCombineConfig config;
   int fp8BlockwiseCombineScaleDim{0};
+  size_t v2DispatchElemSize{0};
   int rdmaBlockNum{-1};
+  int dispatchCopyBlockNum{0};
   bool replayMode{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
@@ -595,11 +645,15 @@ struct LocalExpertCountArgs {
 struct ConvertDispatchOutputArgs {
   EpDispatchCombineConfig config;
   const void* dispatchOutX{nullptr};
+  size_t dispatchOutElemSize{0};
+  const void* dispatchOutScales{nullptr};
+  size_t dispatchOutScaleBytesPerToken{0};
   const void* dispatchOutTopkIdx{nullptr};
   const index_t* dispatchSrcTokenPos{nullptr};
   const index_t* totalRecvTokenNum{nullptr};
   uint32_t* dispatchGridBarrier{nullptr};
   void* packedRecvX{nullptr};
+  void* packedRecvScales{nullptr};
   int* packedRecvCount{nullptr};
   int* packedRecvSrcInfo{nullptr};
   int64_t* packedRecvLayoutRange{nullptr};
