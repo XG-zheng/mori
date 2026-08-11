@@ -975,10 +975,26 @@ inline __device__ void ComputeNodePartialTokenMajor(EpDispatchCombineArgs<T>& ar
                 hiddenOffset;
     }
     // Token-major preprocessing has already reduced and weighted every expert hosted by one
-    // destination PE. Duplicate-PE routes are null in the route map, so compact the live rows
-    // and avoid a fixed top-k accumulation when fewer PEs actually contribute.
-    core::WarpAccum<T, VecBytes>(partial, srcPtrs, nullptr, activeAccumNum,
-                                 hiddenSize);
+    // destination PE. Duplicate-PE routes are null in the route map, so compact the live rows.
+    // Keep the worker's requested unroll: the generic dynamic helper hard-codes unroll=2 and
+    // regresses the production V16/U1 path when all eight destination PEs are active.
+#define V2_TOKEN_ACTIVE_ACCUM_CASE(AccumNum)                                  \
+  case AccumNum:                                                              \
+    core::WarpAccum<T, VecBytes, AccumNum, AccumUnroll>(                      \
+        partial, srcPtrs, nullptr, hiddenSize);                               \
+    break
+    switch (activeAccumNum) {
+      V2_TOKEN_ACTIVE_ACCUM_CASE(1);
+      V2_TOKEN_ACTIVE_ACCUM_CASE(2);
+      V2_TOKEN_ACTIVE_ACCUM_CASE(4);
+      V2_TOKEN_ACTIVE_ACCUM_CASE(6);
+      V2_TOKEN_ACTIVE_ACCUM_CASE(8);
+      default:
+        core::WarpAccumDynamic<T, VecBytes>(
+            partial, srcPtrs, nullptr, activeAccumNum, hiddenSize);
+        break;
+    }
+#undef V2_TOKEN_ACTIVE_ACCUM_CASE
   }
 }
 
