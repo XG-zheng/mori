@@ -929,9 +929,6 @@ inline __device__ void ComputeNodePartialTokenMajor(EpDispatchCombineArgs<T>& ar
   const int sharedSlots = max(nNodes, config.numExpertPerToken);
   extern __shared__ char sharedMem[];
   T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * sharedSlots;
-  float* routeWeights =
-      reinterpret_cast<float*>(reinterpret_cast<T**>(sharedMem) + warpNum * sharedSlots) +
-      warpId * sharedSlots;
   T* staging = args.interNodeV1TokBufs.staging->template GetAs<T*>();
   const uint64_t generation = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   const int tokenCount = core::AtomicLoadRelaxed(args.blockFlagCounter + sourceNode);
@@ -945,21 +942,25 @@ inline __device__ void ComputeNodePartialTokenMajor(EpDispatchCombineArgs<T>& ar
     const size_t hiddenOffset = static_cast<size_t>(tokenPart) * hiddenPerWarp;
     const size_t hiddenSize =
         hiddenOffset < hiddenDim ? min(hiddenDim - hiddenOffset, hiddenPerWarp) : 0;
+    T* routeSrc = nullptr;
     if (laneId < config.numExpertPerToken) {
-      srcPtrs[laneId] = nullptr;
-      routeWeights[laneId] = 0.0f;
       const index_t packed = args.interNodeDispDestTokIdMap[
           V2RouteMapOffset(config, sourceNode, tokenId, laneId)];
       if (packed != NullPackedExpertSlot(config)) {
         const int destPe = PeFromPackedExpertSlot(config, packed);
         const int tokenSlot = LocalSlotFromPackedExpertSlot(config, packed);
-        srcPtrs[laneId] =
+        routeSrc =
             args.interNodeV1TokBufs.combineInp->template GetAs<T*>(destPe) +
             static_cast<size_t>(tokenSlot) * hiddenDim + hiddenOffset;
-        // Token-major preprocessing has already reduced and weighted all experts hosted by this
-        // destination PE. Duplicate PE routes are null in the route map, so each row is added once.
-        routeWeights[laneId] = 1.0f;
       }
+    }
+    const unsigned long long validMask = __ballot(routeSrc != nullptr);
+    const int activeAccumNum = __popcll(validMask);
+    if (routeSrc != nullptr) {
+      const unsigned long long lowerLanes =
+          (1ull << static_cast<unsigned>(laneId)) - 1ull;
+      const int compactSlot = __popcll(validMask & lowerLanes);
+      srcPtrs[compactSlot] = routeSrc;
     }
     __syncwarp();
 
@@ -973,23 +974,11 @@ inline __device__ void ComputeNodePartialTokenMajor(EpDispatchCombineArgs<T>& ar
                                                    tokenId) +
                 hiddenOffset;
     }
-#define V2_TOKEN_WARP_ACCUM_CASE(AccumNum)                                      \
-  case AccumNum:                                                                \
-    core::WarpAccum<T, VecBytes, AccumNum, AccumUnroll>(partial, srcPtrs, routeWeights, \
-                                                  hiddenSize);                   \
-    break
-    switch (config.numExpertPerToken) {
-      V2_TOKEN_WARP_ACCUM_CASE(1);
-      V2_TOKEN_WARP_ACCUM_CASE(2);
-      V2_TOKEN_WARP_ACCUM_CASE(4);
-      V2_TOKEN_WARP_ACCUM_CASE(6);
-      V2_TOKEN_WARP_ACCUM_CASE(8);
-      default:
-        core::WarpAccum<T, 8>(partial, srcPtrs, routeWeights,
-                              config.numExpertPerToken, hiddenSize);
-        break;
-    }
-#undef V2_TOKEN_WARP_ACCUM_CASE
+    // Token-major preprocessing has already reduced and weighted every expert hosted by one
+    // destination PE. Duplicate-PE routes are null in the route map, so compact the live rows
+    // and avoid a fixed top-k accumulation when fewer PEs actually contribute.
+    core::WarpAccum<T, VecBytes>(partial, srcPtrs, nullptr, activeAccumNum,
+                                 hiddenSize);
   }
 }
 
@@ -1130,6 +1119,11 @@ template <typename T>
 inline __device__ void ResetAfterCombine(EpDispatchCombineArgs<T>& args) {
   ResetAfterCombineGroup(args, blockIdx.x * blockDim.x + threadIdx.x,
                          gridDim.x * blockDim.x);
+}
+
+template <typename T>
+inline __device__ void ResetAfterCombineBlock(EpDispatchCombineArgs<T>& args) {
+  ResetAfterCombineGroup(args, threadIdx.x, blockDim.x);
 }
 
 }  // namespace v2
@@ -1277,7 +1271,7 @@ __device__ void EpCombineInterNodeV2LLFinalize_body(EpDispatchCombineArgs<T> arg
   if (v2::CompleteGridForBlockZero(args.combineGridBarrier, blockNum)) {
     const uint64_t generation = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
     // One CTA resets the transient counters after all finalize CTAs have completed.
-    v2::ResetAfterCombine(args);
+    v2::ResetAfterCombineBlock(args);
     v2::SyncLocalResetCompletion(args, generation);
     v2::CombineSendQuiet(args);
   }

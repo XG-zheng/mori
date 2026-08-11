@@ -61,6 +61,8 @@ const char* V2PhaseName(EpDispatchCombineHandle::V2LifecyclePhase phase) {
       return "ready-combine";
     case EpDispatchCombineHandle::V2LifecyclePhase::LaunchingCombine:
       return "launching-combine";
+    case EpDispatchCombineHandle::V2LifecyclePhase::Poisoned:
+      return "poisoned-after-launch-failure";
   }
   return "unknown";
 }
@@ -107,8 +109,11 @@ void EpDispatchCombineHandle::CommitV2Dispatch() {
 void EpDispatchCombineHandle::AbortV2Dispatch() {
   if (!IsInterNodeV2DirectType(config.kernelType)) return;
   std::lock_guard<std::mutex> lock(v2LifecycleMutex);
+  // A launch failure may occur after one or more kernels were already enqueued. Rolling the
+  // host phase back would allow a new generation to reuse transport/counter storage while those
+  // kernels are still live. Fail closed: the handle must be destroyed after an abort.
   if (v2LifecyclePhase == V2LifecyclePhase::LaunchingDispatch)
-    v2LifecyclePhase = V2LifecyclePhase::ReadyDispatch;
+    v2LifecyclePhase = V2LifecyclePhase::Poisoned;
 }
 
 void EpDispatchCombineHandle::BeginV2Combine(hipStream_t stream) {
@@ -136,7 +141,7 @@ void EpDispatchCombineHandle::AbortV2Combine() {
   if (!IsInterNodeV2DirectType(config.kernelType)) return;
   std::lock_guard<std::mutex> lock(v2LifecycleMutex);
   if (v2LifecyclePhase == V2LifecyclePhase::LaunchingCombine)
-    v2LifecyclePhase = V2LifecyclePhase::ReadyCombine;
+    v2LifecyclePhase = V2LifecyclePhase::Poisoned;
 }
 
 std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {

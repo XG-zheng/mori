@@ -356,6 +356,7 @@ class EpDispatchCombineHandle {
     LaunchingDispatch,
     ReadyCombine,
     LaunchingCombine,
+    Poisoned,
   };
 
   void BeginV2Dispatch(hipStream_t stream);

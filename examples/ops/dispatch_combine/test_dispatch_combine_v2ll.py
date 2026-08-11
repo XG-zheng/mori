@@ -3,8 +3,10 @@
 """Continuous multi-node bitwise validation for production InterNodeV2LL."""
 
 import argparse
+import hashlib
 import json
 import os
+from pathlib import Path
 
 import mori
 import torch
@@ -36,6 +38,34 @@ def _all_gather(tensor, world_size):
     return gathered
 
 
+def _sha256_file(path):
+    path = Path(path)
+    if not path.is_file():
+        return "missing"
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runtime_code_sha256():
+    from mori.ops._jit_loader import _compiled_hsaco
+
+    repo_root = Path(__file__).resolve().parents[3]
+    return {
+        "internode_v2.cpp": _sha256_file(
+            repo_root / "src/ops/dispatch_combine/internode_v2.cpp"
+        ),
+        "dispatch_combine.py": _sha256_file(
+            repo_root / "python/mori/ops/dispatch_combine.py"
+        ),
+        "ep_internode_v2.hsaco": _sha256_file(
+            _compiled_hsaco.get("ep_internode_v2", "")
+        ),
+    }
+
+
 def _stress_token_count(round_id, rank, max_tokens):
     """Make every rank visit every count in [0, max_tokens] over max_tokens + 1 rounds."""
     return (round_id * 37 + rank * 17) % (max_tokens + 1)
@@ -62,7 +92,16 @@ def _stress_routes(round_id, rank, max_tokens, args, device):
             rank * 19 + token * 13 + route * 31 + round_id * 7
         ) % args.num_experts
     elif pattern == 1:
-        indices = rank * experts_per_rank + route.expand(max_tokens, -1)
+        # Exercise the tail counters as well as the common low expert IDs. This catches
+        # block-0 reset implementations that accidentally use a full-grid stride.
+        indices = (
+            rank * experts_per_rank
+            + (
+                max(experts_per_rank - args.topk, 0)
+                + route.expand(max_tokens, -1)
+            )
+            % experts_per_rank
+        )
     elif pattern == 2:
         remote_rank = (rank + args.gpu_per_node) % world_size
         indices = remote_rank * experts_per_rank + route.expand(max_tokens, -1)
@@ -546,6 +585,7 @@ def _run_variable_stress(op, rank, dispatch_dtype, args, layout):
             + json.dumps(
                 {
                     "bitwise": True,
+                    "code_sha256": _runtime_code_sha256(),
                     "dispatch_dtype": args.dispatch_dtype,
                     "layout": layout,
                     "max_tokens": args.max_tokens,
@@ -597,6 +637,19 @@ def _worker(local_rank, args):
     op = mori.ops.EpDispatchCombineOp(config)
     torch.cuda.set_device(local_rank)
     _run_variable_stress(op, rank, dispatch_dtype, args, args.layout)
+    if args.validate_lifecycle:
+        stream = torch.cuda.current_stream().cuda_stream
+        mori.cpp.begin_v2_dispatch(op._handle, stream)
+        mori.cpp.abort_v2_dispatch(op._handle)
+        try:
+            mori.cpp.begin_v2_dispatch(op._handle, stream)
+        except RuntimeError as exc:
+            if "poisoned-after-launch-failure" not in str(exc):
+                raise
+        else:
+            raise AssertionError("V2 lifecycle reused a poisoned handle")
+        if rank == 0:
+            print("MORI_V2_ABORT_FAIL_CLOSED true", flush=True)
     mori.shmem.shmem_finalize()
     dist.destroy_process_group()
 
@@ -622,6 +675,7 @@ def main():
     parser.add_argument("--combine-blocks", type=int, default=56)
     parser.add_argument("--warps", type=int, default=4)
     parser.add_argument("--combine-warps", type=int, default=8)
+    parser.add_argument("--validate-lifecycle", action="store_true")
     parser.add_argument("--rdma-qps", type=int, default=2)
     args = parser.parse_args()
     if args.max_tokens > 128:
