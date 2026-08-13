@@ -908,7 +908,10 @@ inline __device__ void DispatchSyncCta(EpDispatchCombineArgs<T>& args, int expec
 // polling wave even though nonzero CTAs immediately exit. Collapse this edge to one arrival per
 // CTA and a block-zero-only waiter.
 inline __device__ bool CompleteGridForBlockZero(uint32_t* counter, int blockNum) {
-  __threadfence_system();
+  // The block-zero epilogue does not consume producer output; it only resets
+  // control state after every CTA has arrived. combineOut is exposed after
+  // kernel completion on the caller's stream, which is also the reuse edge for
+  // the next generation, so no producer-side memory fence is required here.
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(counter, 1u);
   if (blockIdx.x != 0) return false;
@@ -1325,29 +1328,32 @@ inline __device__ void FinalizeNodePartials(EpDispatchCombineArgs<T>& args) {
   const uint64_t generation = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   const int outputTokens = max(static_cast<int>(args.curRankNumToken), 1);
   const int warpsPerToken = max(globalWarpNum / outputTokens, 1);
-  const size_t hiddenPerWarp = core::CeilDiv(hiddenDim, static_cast<size_t>(warpsPerToken));
+  const size_t hiddenPerWarp =
+      core::CeilDiv(hiddenDim, static_cast<size_t>(warpsPerToken));
 
-  const int sharedSlots = max(nNodes, config.numExpertPerToken);
-  extern __shared__ char sharedMem[];
-  T** nodePtrs = reinterpret_cast<T**>(sharedMem) + warpId * sharedSlots;
-  for (int work = globalWarpId; work < args.curRankNumToken * warpsPerToken;
+  for (int work = globalWarpId;
+       work < args.curRankNumToken * warpsPerToken;
        work += globalWarpNum) {
     const int tokenId = work / warpsPerToken;
     const int tokenPart = work % warpsPerToken;
-    const size_t hiddenOffset = static_cast<size_t>(tokenPart) * hiddenPerWarp;
-    const size_t hiddenSize =
-        (hiddenOffset < hiddenDim) ? min(hiddenDim - hiddenOffset, hiddenPerWarp) : 0;
-    if (laneId < nNodes - 1) {
-      const int node = (myNode + laneId + 1) % nNodes;
-      nodePtrs[laneId] =
-          staging + CombineNodeSlotOffsetForGeneration(config, generation, node, tokenId) +
-          hiddenOffset;
-    }
-    __syncwarp();
+    const size_t hiddenOffset =
+        static_cast<size_t>(tokenPart) * hiddenPerWarp;
+    const size_t hiddenSize = hiddenOffset < hiddenDim
+                                  ? min(hiddenDim - hiddenOffset, hiddenPerWarp)
+                                  : 0;
     T* output = args.interNodeV1TokBufs.combineOut->template GetAs<T*>() +
                 static_cast<size_t>(tokenId) * hiddenDim + hiddenOffset;
-    for (int node = 0; node < nNodes - 1; ++node) {
-      core::WarpAccum(output, nodePtrs[node], hiddenSize);
+    // Contributor pointers are uniform across the warp. Compute them directly
+    // in ring order instead of staging them through shared memory for every
+    // output slice. The accumulation order and generic N-node behavior remain
+    // unchanged.
+    for (int step = 1; step < nNodes; ++step) {
+      const int contributorNode = (myNode + step) % nNodes;
+      T* remote = staging +
+                  CombineNodeSlotOffsetForGeneration(
+                      config, generation, contributorNode, tokenId) +
+                  hiddenOffset;
+      core::WarpAccum(output, remote, hiddenSize);
     }
   }
 }

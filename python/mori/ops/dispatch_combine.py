@@ -217,12 +217,12 @@ _V2LL_DEFAULT_LAUNCH_SCHEDULES = {
     # These are production acceptance points for BF16 EP16 on MI355X/MI350X.
     # Explicit launch arguments and config copy-block overrides stay authoritative.
     ("mi355x", 16, 8, 7168, 8, torch.bfloat16): (
-        (32, 128, 4, 32, 56, 8),
+        (32, 128, 4, 32, 56, 4),
         (64, 160, 4, 32, 112, 4),
         (128, 160, 4, 32, 112, 4),
     ),
     ("mi350x", 16, 8, 7168, 8, torch.bfloat16): (
-        (32, 128, 4, 32, 56, 8),
+        (32, 128, 4, 32, 56, 4),
         (64, 160, 4, 32, 112, 4),
         (128, 160, 4, 32, 112, 4),
     ),
@@ -2017,15 +2017,20 @@ class EpDispatchCombineOp:
                 )
             mori_cpp.begin_v2_combine(self._handle, stream)
             try:
+                finalize_blocks = (
+                    32
+                    if use_tuned_default and int(cur_n) <= 32
+                    else actual_bn
+                )
                 self._launch_multi(
                     [
                         f"{remote_kernel}_bf16",
                         f"{local_kernel}_bf16",
                         "EpCombineInterNodeV2LLFinalize_bf16",
                     ],
-                    [actual_bn, actual_bn, actual_bn],
+                    [actual_bn, actual_bn, finalize_blocks],
                     [block[0], block[0], block[0]],
-                    [shared_mem, shared_mem, shared_mem],
+                    [shared_mem, shared_mem, 0],
                     stream,
                     args_ptr,
                 )
