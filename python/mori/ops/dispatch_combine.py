@@ -228,6 +228,18 @@ _V2LL_DEFAULT_LAUNCH_SCHEDULES = {
     ),
 }
 
+if hasattr(torch, "float8_e4m3fn"):
+    _V2LL_FP8_LAUNCH_SCHEDULE = (
+        # Keep one node-wide schedule for variable per-rank token counts. V2LL
+        # peers cooperate inside Dispatch, so rank-local bucket changes must not
+        # select different resident grids within the same node.
+        (128, 96, 4, 16, 56, 8),
+    )
+    for _model in ("mi355x", "mi350x"):
+        _V2LL_DEFAULT_LAUNCH_SCHEDULES[
+            (_model, 16, 8, 7168, 8, torch.float8_e4m3fn)
+        ] = _V2LL_FP8_LAUNCH_SCHEDULE
+
 
 def _v2ll_default_launch(config, num_tokens, dtype, *, is_dispatch):
     """Return a validated production launch bucket, or ``None``."""
