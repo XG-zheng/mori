@@ -1711,16 +1711,7 @@ class EpDispatchCombineOp:
             hidden_dim=hidden_dim,
         )
         block = (WARP_SIZE * actual_wpb,)
-        # The validated FP8 expert-major default uses CTA-level release-sequence completion in
-        # the multi-warp kernel. It removes redundant per-thread system fences while preserving
-        # the generic N-node/1..8-QP data contract. Token-major keeps its conservative baseline.
-        use_multi_warp_copy = use_tuned_default and (
-            int(input.size(0)) == 64
-            or (
-                self.config.v2_layout == "expert_major"
-                and input.dtype == getattr(torch, "float8_e4m3fn", None)
-            )
-        )
+        use_multi_warp_copy = use_tuned_default and int(input.size(0)) == 64
         if self.config.v2_layout == "token_major":
             dispatch_kernel = (
                 "EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy"
