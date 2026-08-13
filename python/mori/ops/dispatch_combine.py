@@ -210,6 +210,59 @@ def _is_v2_direct_type(kernel_type):
     return kernel_type.value == EpDispatchCombineKernelType.InterNodeV2LL.value
 
 
+_V2LL_DEFAULT_LAUNCH_SCHEDULES = {
+    # (device, world, GPUs/node, hidden, topk, dtype):
+    # (max_tokens, dispatch_blocks, dispatch_warps, copy_blocks,
+    #  combine_blocks, combine_warps)
+    # These are production acceptance points for BF16 EP16 on MI355X/MI350X.
+    # Explicit launch arguments and config copy-block overrides stay authoritative.
+    ("mi355x", 16, 8, 7168, 8, torch.bfloat16): (
+        (32, 128, 4, 32, 56, 8),
+        (64, 160, 4, 32, 112, 4),
+        (128, 160, 4, 32, 112, 4),
+    ),
+    ("mi350x", 16, 8, 7168, 8, torch.bfloat16): (
+        (32, 128, 4, 32, 56, 8),
+        (64, 160, 4, 32, 112, 4),
+        (128, 160, 4, 32, 112, 4),
+    ),
+}
+
+
+def _v2ll_default_launch(config, num_tokens, dtype, *, is_dispatch):
+    """Return a validated production launch bucket, or ``None``."""
+    if config.kernel_type != EpDispatchCombineKernelType.InterNodeV2LL:
+        return None
+    from mori.ops import utils as gpu_utils
+
+    key = (
+        gpu_utils.detect_model(),
+        config.world_size,
+        config.gpu_per_node,
+        config.hidden_dim,
+        config.num_experts_per_token,
+        dtype,
+    )
+    schedule = _V2LL_DEFAULT_LAUNCH_SCHEDULES.get(key)
+    if schedule is None:
+        return None
+    for (
+        max_tokens,
+        dispatch_blocks,
+        dispatch_warps,
+        copy_blocks,
+        combine_blocks,
+        combine_warps,
+    ) in schedule:
+        if num_tokens <= max_tokens:
+            return (
+                (dispatch_blocks, dispatch_warps, copy_blocks)
+                if is_dispatch
+                else (combine_blocks, combine_warps, 0)
+            )
+    return None
+
+
 # dtype → kernel name suffix
 _DTYPE_SUFFIX = {
     torch.float32: "f32",
@@ -1589,13 +1642,23 @@ class EpDispatchCombineOp:
             dtype=input.dtype,
             tuning_rules=self._dispatch_rules,
         )
+        use_default_launch = block_num <= 0 and warp_per_block <= 0
+        default_copy_blocks = 0
+        use_tuned_default = False
+        if use_default_launch:
+            v2ll_default = _v2ll_default_launch(
+                self.config, int(input.size(0)), input.dtype, is_dispatch=True
+            )
+            if v2ll_default is not None:
+                actual_bn, actual_wpb, default_copy_blocks = v2ll_default
+                use_tuned_default = True
         num_nodes = self.config.world_size // self.config.gpu_per_node
         if actual_wpb < self.config.num_qp_per_pe:
             raise ValueError(
                 "V2LL Dispatch requires at least one sender warp per QP: "
                 f"warps={actual_wpb}, qps={self.config.num_qp_per_pe}"
             )
-        copy_blocks = self.config.v2_copy_block_num or max(
+        copy_blocks = self.config.v2_copy_block_num or default_copy_blocks or max(
             self.config.num_qp_per_pe, actual_bn // 4
         )
         if copy_blocks >= actual_bn or actual_bn - copy_blocks < num_nodes:
@@ -1636,11 +1699,19 @@ class EpDispatchCombineOp:
             hidden_dim=hidden_dim,
         )
         block = (WARP_SIZE * actual_wpb,)
-        dispatch_kernel = (
-            "EpDispatchInterNodeV2LLTokenMajor"
-            if self.config.v2_layout == "token_major"
-            else "EpDispatchInterNodeV2LLKernel"
-        )
+        use_multi_warp_copy = use_tuned_default and int(input.size(0)) == 64
+        if self.config.v2_layout == "token_major":
+            dispatch_kernel = (
+                "EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy"
+                if use_multi_warp_copy
+                else "EpDispatchInterNodeV2LLTokenMajor"
+            )
+        else:
+            dispatch_kernel = (
+                "EpDispatchInterNodeV2LLMultiWarpCopy"
+                if use_multi_warp_copy
+                else "EpDispatchInterNodeV2LLKernel"
+            )
         mori_cpp.begin_v2_dispatch(self._handle, stream)
         try:
             self._launch(
@@ -1785,6 +1856,15 @@ class EpDispatchCombineOp:
             zero_copy=False,
             quant_type=self._qt_str,
         )
+        use_default_launch = block_num <= 0 and warp_per_block <= 0
+        use_tuned_default = False
+        if use_default_launch:
+            v2ll_default = _v2ll_default_launch(
+                self.config, int(cur_n), input.dtype, is_dispatch=False
+            )
+            if v2ll_default is not None:
+                actual_bn, actual_wpb, _ = v2ll_default
+                use_tuned_default = True
         stream = _current_stream()
         sfx = _DTYPE_SUFFIX[input.dtype]
 
@@ -1895,16 +1975,34 @@ class EpDispatchCombineOp:
                     f"V2LL combine hidden_dim mismatch: input={hidden_dim}, "
                     f"registered={registered_hidden}"
                 )
-            remote_kernel = (
-                "EpCombineInterNodeV2LLRemotePartialTokenMajorV16"
-                if self.config.v2_layout == "token_major"
-                else "EpCombineInterNodeV2LLRemotePartialV16"
+            use_qp_early = (
+                use_tuned_default
+                and int(cur_n) == 64
+                and self.config.num_qp_per_pe > 1
+                and (hidden_dim * input.element_size()) % 2048 == 0
             )
-            local_kernel = (
-                "EpCombineInterNodeV2LLSendLocalTokenMajorV16"
-                if self.config.v2_layout == "token_major"
-                else "EpCombineInterNodeV2LLSendLocalV16"
-            )
+            if self.config.v2_layout == "token_major":
+                remote_kernel = (
+                    "EpCombineInterNodeV2LLRemotePartialTokenMajorQpEarlyV16"
+                    if use_qp_early
+                    else "EpCombineInterNodeV2LLRemotePartialTokenMajorV16"
+                )
+                local_kernel = (
+                    "EpCombineInterNodeV2LLLocalTokenMajorQpEarlyV16"
+                    if use_qp_early
+                    else "EpCombineInterNodeV2LLSendLocalTokenMajorV16"
+                )
+            else:
+                remote_kernel = (
+                    "EpCombineInterNodeV2LLRemotePartialQpEarlyV16"
+                    if use_qp_early
+                    else "EpCombineInterNodeV2LLRemotePartialV16"
+                )
+                local_kernel = (
+                    "EpCombineInterNodeV2LLLocalQpEarlyV16"
+                    if use_qp_early
+                    else "EpCombineInterNodeV2LLSendLocalV16"
+                )
             mori_cpp.begin_v2_combine(self._handle, stream)
             try:
                 self._launch_multi(

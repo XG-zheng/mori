@@ -14,6 +14,24 @@ namespace v2 {
 constexpr size_t kRdmaSplitAlignment = 2048;
 constexpr int kQpCounterBaseSlot = 4;
 constexpr int kResetReleaseSlot = 15;
+constexpr int kQpEarlyCounterBaseSlot = 16;
+
+inline __host__ __device__ int QpEarlyCounterSlot(
+    const EpDispatchCombineConfig& config, int sourceNode, int qpId) {
+  return kQpEarlyCounterBaseSlot + sourceNode * config.numQpPerPe + qpId;
+}
+
+inline __host__ __device__ int QpEarlyControlWords(
+    const EpDispatchCombineConfig& config) {
+  const int nNodes = config.worldSize / config.gpuPerNode;
+  return kQpEarlyCounterBaseSlot + nNodes * config.numQpPerPe;
+}
+
+inline __device__ uint32_t* QpEarlyCounter(
+    const EpDispatchCombineConfig& config, uint32_t* barrier,
+    int sourceNode, int qpId) {
+  return barrier + QpEarlyCounterSlot(config, sourceNode, qpId);
+}
 
 inline __device__ bool UseV2LLEpochSignals(const EpDispatchCombineConfig& config) {
   return config.kernelType == KernelType::InterNodeV2LL;
@@ -521,6 +539,54 @@ inline __device__ void CopyTokenToStaging(EpDispatchCombineArgs<T>& args, uint8_
 }
 
 template <typename T>
+inline __device__ void CopyTokenPartToStaging(
+    EpDispatchCombineArgs<T>& args, uint8_t* staging, int tokenId,
+    int tokenPart, int warpsPerToken) {
+  DEF_COMMON_VARS;
+  uint8_t* dest = staging + static_cast<size_t>(tokenId) * xferBytes;
+  const uint8_t* source =
+      reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
+      static_cast<size_t>(tokenId) * hiddenBytes;
+  const size_t hiddenBytesPerWarp =
+      core::CeilDiv(core::CeilDiv(hiddenBytes,
+                                  static_cast<size_t>(warpsPerToken)),
+                    size_t{16}) *
+      size_t{16};
+  const size_t hiddenOffset =
+      static_cast<size_t>(tokenPart) * hiddenBytesPerWarp;
+  const size_t hiddenChunk =
+      hiddenOffset < hiddenBytes
+          ? min(hiddenBytes - hiddenOffset, hiddenBytesPerWarp)
+          : 0;
+  if (hiddenChunk > 0)
+    core::WarpCopy<uint8_t, 8>(dest + hiddenOffset, source + hiddenOffset,
+                               hiddenChunk);
+
+  if (tokenPart != 0) return;
+  core::WarpCopy<uint8_t, 4>(
+      dest + hiddenBytes,
+      reinterpret_cast<const uint8_t*>(args.tokenIndices) +
+          static_cast<size_t>(tokenId) * indexBytes,
+      indexBytes);
+  core::WarpCopy<uint8_t, 4>(
+      dest + hiddenBytes + indexBytes,
+      reinterpret_cast<const uint8_t*>(args.weightsBuf) +
+          static_cast<size_t>(tokenId) * weightBytes,
+      weightBytes);
+  if (scaleBytes > 0) {
+    WarpCopyScaleRow(
+        dest + hiddenBytes + indexBytes + weightBytes,
+        args.scalesBuf + static_cast<size_t>(tokenId) * scaleBytes,
+        scaleBytes);
+  }
+  if (laneId == 0) {
+    reinterpret_cast<index_t*>(
+        dest + hiddenBytes + indexBytes + weightBytes + scaleBytes)[0] =
+        static_cast<index_t>(FlatTokenIndex(config, config.rank, tokenId));
+  }
+}
+
+template <typename T>
 inline __device__ uint8_t* DispatchStagingBase(EpDispatchCombineArgs<T>& args,
                                                uint64_t generation) {
   return args.interNodeV1TokBufs.dispatchStaging->template GetAs<uint8_t*>() +
@@ -537,6 +603,29 @@ inline __device__ void CopyToStagingGroup(EpDispatchCombineArgs<T>& args, int gr
   uint8_t* staging = DispatchStagingBase(args, generation);
   for (int tokenId = groupWarpId; tokenId < args.curRankNumToken; tokenId += groupWarpNum) {
     CopyTokenToStaging(args, staging, tokenId);
+  }
+}
+
+template <typename T>
+inline __device__ void CopyToStagingGroupMultiWarp(
+    EpDispatchCombineArgs<T>& args, int groupBlockId, int groupBlockNum) {
+  DEF_COMMON_VARS;
+  const uint64_t generation =
+      core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+  const int groupWarpId = groupBlockId * warpNum + warpId;
+  const int groupWarpNum = groupBlockNum * warpNum;
+  uint8_t* staging = DispatchStagingBase(args, generation);
+  const int warpsPerToken =
+      args.curRankNumToken > 0
+          ? core::CeilDiv(groupWarpNum,
+                          static_cast<int>(args.curRankNumToken))
+          : 1;
+  const int workCount = args.curRankNumToken * warpsPerToken;
+  for (int work = groupWarpId; work < workCount; work += groupWarpNum) {
+    const int tokenId = work / warpsPerToken;
+    const int tokenPart = work % warpsPerToken;
+    CopyTokenPartToStaging(args, staging, tokenId, tokenPart,
+                           warpsPerToken);
   }
 }
 
@@ -561,6 +650,33 @@ inline __device__ void CopyToStagingQpGroup(EpDispatchCombineArgs<T>& args, int 
   uint8_t* staging = DispatchStagingBase(args, generation);
   for (int qpToken = groupWarpId; qpToken < qpTokenCount; qpToken += groupWarpNum) {
     CopyTokenToStaging(args, staging, tokenBegin + qpToken);
+  }
+}
+
+template <typename T>
+inline __device__ void CopyToStagingQpGroupMultiWarp(
+    EpDispatchCombineArgs<T>& args, int qpId, int groupBlockId,
+    int groupBlockNum) {
+  DEF_COMMON_VARS;
+  const uint64_t generation =
+      core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag) + 1;
+  int tokenBegin = 0;
+  int qpTokenCount = 0;
+  TokenQpSlice(args.curRankNumToken, config.numQpPerPe, qpId,
+               tokenBegin, qpTokenCount);
+  const int groupWarpId = groupBlockId * warpNum + warpId;
+  const int groupWarpNum = groupBlockNum * warpNum;
+  const int warpsPerToken =
+      qpTokenCount > 0
+          ? core::CeilDiv(groupWarpNum, qpTokenCount)
+          : 1;
+  const int workCount = qpTokenCount * warpsPerToken;
+  uint8_t* staging = DispatchStagingBase(args, generation);
+  for (int work = groupWarpId; work < workCount; work += groupWarpNum) {
+    const int tokenOffset = work / warpsPerToken;
+    const int tokenPart = work % warpsPerToken;
+    CopyTokenPartToStaging(args, staging, tokenBegin + tokenOffset,
+                           tokenPart, warpsPerToken);
   }
 }
 
@@ -922,6 +1038,92 @@ inline __device__ void ComputeNodePartial(EpDispatchCombineArgs<T>& args, int so
   ComputeNodePartialGroup<T, AccumUnroll, VecBytes>(args, sourceNode, blockIdx.x, gridDim.x);
 }
 
+template <typename T, bool TokenMajor, int AccumUnroll = 2,
+          int VecBytes = 8>
+inline __device__ void ComputeNodePartialQpGroup(
+    EpDispatchCombineArgs<T>& args, int sourceNode, int qpId,
+    int groupBlockId, int groupBlockNum) {
+  DEF_COMMON_VARS;
+  const int sharedSlots = max(nNodes, config.numExpertPerToken);
+  extern __shared__ char sharedMem[];
+  T** srcPtrs = reinterpret_cast<T**>(sharedMem) + warpId * sharedSlots;
+  float* routeWeights = reinterpret_cast<float*>(
+      reinterpret_cast<T**>(sharedMem) + warpNum * sharedSlots) +
+      warpId * sharedSlots;
+  T* staging = args.interNodeV1TokBufs.staging->template GetAs<T*>();
+  const uint64_t generation =
+      core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  const int sourceTokenCount =
+      core::AtomicLoadRelaxed(args.blockFlagCounter + sourceNode);
+  int tokenBegin = 0;
+  int tokenCount = 0;
+  TokenQpSlice(sourceTokenCount, config.numQpPerPe, qpId, tokenBegin,
+               tokenCount);
+  const int groupWarpId = groupBlockId * warpNum + warpId;
+  const int groupWarpNum = groupBlockNum * warpNum;
+  const int warpsPerToken =
+      max(groupWarpNum / max(tokenCount, 1), 1);
+  const size_t hiddenPerWarp =
+      core::CeilDiv(hiddenDim, static_cast<size_t>(warpsPerToken));
+
+  for (int work = groupWarpId; work < tokenCount * warpsPerToken;
+       work += groupWarpNum) {
+    const int tokenOffset = work / warpsPerToken;
+    const int tokenId = tokenBegin + tokenOffset;
+    const int tokenPart = work % warpsPerToken;
+    const size_t hiddenOffset =
+        static_cast<size_t>(tokenPart) * hiddenPerWarp;
+    const size_t hiddenSize =
+        hiddenOffset < hiddenDim
+            ? min(hiddenDim - hiddenOffset, hiddenPerWarp)
+            : 0;
+    T* routeSrc = nullptr;
+    if (laneId < config.numExpertPerToken) {
+      const index_t packed = args.interNodeDispDestTokIdMap[
+          V2RouteMapOffset(config, sourceNode, tokenId, laneId)];
+      if (packed != NullPackedExpertSlot(config)) {
+        const int destPe = PeFromPackedExpertSlot(config, packed);
+        const int linearSlot = LocalSlotFromPackedExpertSlot(config, packed);
+        routeSrc =
+            args.interNodeV1TokBufs.combineInp->template GetAs<T*>(destPe) +
+            static_cast<size_t>(linearSlot) * hiddenDim + hiddenOffset;
+      }
+      srcPtrs[laneId] = routeSrc;
+      if constexpr (!TokenMajor) {
+        routeWeights[laneId] =
+            routeSrc == nullptr
+                ? 0.0f
+                : CombineRouteWeight(args, sourceNode, generation, tokenId,
+                                     laneId);
+      }
+    }
+    __syncwarp();
+
+    T* partial =
+        staging + CombineNodeSlotOffsetForGeneration(
+                      config, generation, nNodes + sourceNode, tokenId) +
+        hiddenOffset;
+#define V2_QP_ACCUM_CASE(AccumNum)                                             \
+  case AccumNum:                                                              \
+    core::WarpAccum<T, VecBytes, AccumNum, AccumUnroll>(                      \
+        partial, srcPtrs, TokenMajor ? nullptr : routeWeights, hiddenSize);   \
+    break
+    switch (config.numExpertPerToken) {
+      V2_QP_ACCUM_CASE(1);
+      V2_QP_ACCUM_CASE(2);
+      V2_QP_ACCUM_CASE(4);
+      V2_QP_ACCUM_CASE(6);
+      V2_QP_ACCUM_CASE(8);
+      default:
+        core::WarpAccum<T, VecBytes>(
+            partial, srcPtrs, TokenMajor ? nullptr : routeWeights,
+            config.numExpertPerToken, hiddenSize);
+        break;
+    }
+#undef V2_QP_ACCUM_CASE
+  }
+}
+
 template <typename T, int AccumUnroll = 2, int VecBytes = 8>
 inline __device__ void ComputeNodePartialTokenMajor(EpDispatchCombineArgs<T>& args,
                                                     int sourceNode) {
@@ -1035,6 +1237,51 @@ inline __device__ void CombineOneShotSend(EpDispatchCombineArgs<T>& args) {
 }
 
 template <typename T>
+inline __device__ void CombineOneShotSendSourceQp(
+    EpDispatchCombineArgs<T>& args, int sourceNode, int qpId) {
+  DEF_COMMON_VARS;
+  if (qpId >= config.numQpPerPe || sourceNode == myNode) return;
+
+  const int proxyPe = sourceNode * config.gpuPerNode +
+                      (config.rank % config.gpuPerNode);
+  const int tokenCount =
+      core::AtomicLoadRelaxed(args.blockFlagCounter + sourceNode);
+  const uint64_t generation =
+      core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+  int tokenBegin = 0;
+  int qpTokenCount = 0;
+  TokenQpSlice(tokenCount, config.numQpPerPe, qpId, tokenBegin,
+               qpTokenCount);
+  const size_t byteOffset =
+      static_cast<size_t>(tokenBegin) * hiddenBytes;
+  const size_t bytes =
+      static_cast<size_t>(qpTokenCount) * hiddenBytes;
+  const size_t localOffset =
+      CombineNodeSlotOffsetForGeneration(config, generation,
+                                         nNodes + sourceNode, 0) *
+          sizeof(T) +
+      byteOffset;
+  const size_t remoteOffset =
+      CombineNodeSlotOffsetForGeneration(config, generation, myNode, 0) *
+          sizeof(T) +
+      byteOffset;
+  const uint64_t signal = EncodeReadySignal(
+      config, generation, static_cast<uint32_t>(tokenCount) + 1);
+  const size_t signalOffset =
+      CombineSignalSlot(config, myNode, qpId) * sizeof(uint64_t);
+  if (bytes > 0) {
+    shmem::ShmemPutMemNbiSignalThread(
+        args.interNodeV1TokBufs.staging, remoteOffset,
+        args.interNodeV1TokBufs.staging, localOffset, bytes,
+        args.nodeRecvTokenNumMemObj, signalOffset, signal,
+        core::atomicType::AMO_SET, proxyPe, qpId);
+  } else {
+    shmem::ShmemPutTypeImmNbiThread<uint64_t>(
+        args.nodeRecvTokenNumMemObj, signalOffset, signal, proxyPe, qpId);
+  }
+}
+
+template <typename T>
 inline __device__ void CombineSendQuiet(EpDispatchCombineArgs<T>& args) {
   // The attached remote signal is the completion edge consumed by the destination. A blocking
   // local CQ drain here serializes the inverse XGMI/RDMA pipeline and is not required before the
@@ -1120,6 +1367,9 @@ inline __device__ void ResetAfterCombineGroup(EpDispatchCombineArgs<T>& args,
     core::AtomicStoreSeqCstSystem(args.srcPeTokenIdxMap, index_t{0});
   for (int node = groupThreadId; node < nNodes; node += groupThreadNum)
     core::AtomicStoreRelaxed(args.blockFlagCounter + node, index_t{0});
+  for (int control = kQpEarlyCounterBaseSlot + groupThreadId;
+       control < QpEarlyControlWords(config); control += groupThreadNum)
+    core::AtomicStoreRelaxed(args.combineGridBarrier + control, uint32_t{0});
   if (!UseV2LLEpochSignals(config)) {
     for (int signal = groupThreadId; signal < nNodes * config.numQpPerPe;
          signal += groupThreadNum) {
@@ -1144,7 +1394,7 @@ inline __device__ void ResetAfterCombineBlock(EpDispatchCombineArgs<T>& args) {
 
 }  // namespace v2
 
-template <typename T, bool TokenMajor>
+template <typename T, bool TokenMajor, bool MultiWarpCopy = false>
 inline __device__ void EpDispatchInterNodeV2LLKernelImpl(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   const int copyBlockNum = args.dispatchCopyBlockNum;
@@ -1159,9 +1409,16 @@ inline __device__ void EpDispatchInterNodeV2LLKernelImpl(EpDispatchCombineArgs<T
       const int qpBlockId = blockId / config.numQpPerPe;
       qpBlockNum = core::CeilDiv(copyBlockNum - qpId,
                                 static_cast<int>(config.numQpPerPe));
-      v2::CopyToStagingQpGroup(args, qpId, qpBlockId, qpBlockNum);
+      if constexpr (MultiWarpCopy)
+        v2::CopyToStagingQpGroupMultiWarp(
+            args, qpId, qpBlockId, qpBlockNum);
+      else
+        v2::CopyToStagingQpGroup(args, qpId, qpBlockId, qpBlockNum);
     } else {
-      v2::CopyToStagingGroup(args, blockId, copyBlockNum);
+      if constexpr (MultiWarpCopy)
+        v2::CopyToStagingGroupMultiWarp(args, blockId, copyBlockNum);
+      else
+        v2::CopyToStagingGroup(args, blockId, copyBlockNum);
     }
     // All vector-copy lanes must publish staging before the last producer posts RDMA.
     __threadfence_system();
@@ -1220,6 +1477,20 @@ __device__ void EpDispatchInterNodeV2LLTokenMajor_body(EpDispatchCombineArgs<T> 
   EpDispatchInterNodeV2LLKernelImpl<T, true>(args);
 }
 
+template <typename T, bool RingReceiver>
+__device__ void EpDispatchInterNodeV2LLMultiWarpCopy_body(
+    EpDispatchCombineArgs<T> args) {
+  static_assert(RingReceiver, "production V2LL uses the generic ring receiver");
+  EpDispatchInterNodeV2LLKernelImpl<T, false, true>(args);
+}
+
+template <typename T, bool RingReceiver>
+__device__ void EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy_body(
+    EpDispatchCombineArgs<T> args) {
+  static_assert(RingReceiver, "production V2LL uses the generic ring receiver");
+  EpDispatchInterNodeV2LLKernelImpl<T, true, true>(args);
+}
+
 template <typename T, int AccumUnroll, int VecBytes = 8>
 inline __device__ void EpCombineInterNodeV2LLRemotePartialImpl(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
@@ -1250,6 +1521,53 @@ __device__ void EpCombineInterNodeV2LLRemotePartialTokenMajorV16_body(
   EpCombineInterNodeV2LLRemotePartialTokenMajorImpl<T, 1, 16>(args);
 }
 
+template <typename T, bool TokenMajor>
+inline __device__ void EpCombineInterNodeV2LLRemotePartialQpEarlyImpl(
+    EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  v2::WaitForLocalGroupGemmAllToAll(args);
+
+  const int qpId = blockId % config.numQpPerPe;
+  const int qpBlockId = blockId / config.numQpPerPe;
+  const int qpBlockNum = core::CeilDiv(
+      blockNum - qpId, static_cast<int>(config.numQpPerPe));
+  __shared__ int lastQpProducer;
+#pragma clang loop unroll(disable)
+  for (int step = 1; step < nNodes; ++step) {
+    const int sourceNode = (myNode + step) % nNodes;
+    v2::ComputeNodePartialQpGroup<T, TokenMajor, 1, 16>(
+        args, sourceNode, qpId, qpBlockId, qpBlockNum);
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      uint32_t* counter = v2::QpEarlyCounter(
+          config, args.combineGridBarrier, sourceNode, qpId);
+      lastQpProducer =
+          atomicAdd(counter, 1u) + 1u ==
+          static_cast<uint32_t>(qpBlockNum);
+      if (lastQpProducer) core::AtomicStoreRelaxed(counter, 0u);
+    }
+    __syncthreads();
+    // Send from the last producer on a separate QP stripe immediately after
+    // this source node's XGMI partial is complete. Other CTAs can start the
+    // next ring source while the NIC progresses independently.
+    if (lastQpProducer && threadIdx.x == 0)
+      v2::CombineOneShotSendSourceQp(args, sourceNode, qpId);
+  }
+}
+
+template <typename T>
+__device__ void EpCombineInterNodeV2LLRemotePartialQpEarlyV16_body(
+    EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV2LLRemotePartialQpEarlyImpl<T, false>(args);
+}
+
+template <typename T>
+__device__ void EpCombineInterNodeV2LLRemotePartialTokenMajorQpEarlyV16_body(
+    EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV2LLRemotePartialQpEarlyImpl<T, true>(args);
+}
+
 template <typename T, int AccumUnroll, int VecBytes = 8>
 inline __device__ void EpCombineInterNodeV2LLSendLocalImpl(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
@@ -1275,6 +1593,28 @@ template <typename T>
 __device__ void EpCombineInterNodeV2LLSendLocalTokenMajorV16_body(
     EpDispatchCombineArgs<T> args) {
   EpCombineInterNodeV2LLSendLocalTokenMajorImpl<T, 1, 16>(args);
+}
+
+template <typename T, bool TokenMajor>
+inline __device__ void EpCombineInterNodeV2LLLocalQpEarlyImpl(
+    EpDispatchCombineArgs<T> args) {
+  DEF_COMMON_VARS;
+  if constexpr (TokenMajor)
+    v2::ComputeNodePartialTokenMajor<T, 1, 16>(args, myNode);
+  else
+    v2::ComputeNodePartial<T, 1, 16>(args, myNode);
+}
+
+template <typename T>
+__device__ void EpCombineInterNodeV2LLLocalQpEarlyV16_body(
+    EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV2LLLocalQpEarlyImpl<T, false>(args);
+}
+
+template <typename T>
+__device__ void EpCombineInterNodeV2LLLocalTokenMajorQpEarlyV16_body(
+    EpDispatchCombineArgs<T> args) {
+  EpCombineInterNodeV2LLLocalQpEarlyImpl<T, true>(args);
 }
 
 template <typename T>

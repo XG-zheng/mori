@@ -16,8 +16,26 @@ MORI_FP8_FNUZ(WRAP_BOOL(EpDispatchInterNodeV2LLTokenMajor, fp8_fnuz_ring,
 MORI_FP8_OCP(
     WRAP_BOOL(EpDispatchInterNodeV2LLTokenMajor, fp8_ocp_ring, __hip_fp8_e4m3, true))
 
+WRAP_BOOL(EpDispatchInterNodeV2LLMultiWarpCopy, bf16_ring, hip_bfloat16, true)
+MORI_FP8_FNUZ(WRAP_BOOL(EpDispatchInterNodeV2LLMultiWarpCopy, fp8_fnuz_ring,
+                        __hip_fp8_e4m3_fnuz, true))
+MORI_FP8_OCP(WRAP_BOOL(EpDispatchInterNodeV2LLMultiWarpCopy, fp8_ocp_ring,
+                       __hip_fp8_e4m3, true))
+WRAP_BOOL(EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy, bf16_ring,
+          hip_bfloat16, true)
+MORI_FP8_FNUZ(WRAP_BOOL(EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy,
+                        fp8_fnuz_ring, __hip_fp8_e4m3_fnuz, true))
+MORI_FP8_OCP(WRAP_BOOL(EpDispatchInterNodeV2LLTokenMajorMultiWarpCopy,
+                       fp8_ocp_ring, __hip_fp8_e4m3, true))
+
 WRAP(EpCombineInterNodeV2LLRemotePartialV16, bf16, hip_bfloat16)
 WRAP(EpCombineInterNodeV2LLRemotePartialTokenMajorV16, bf16, hip_bfloat16)
+WRAP(EpCombineInterNodeV2LLRemotePartialQpEarlyV16, bf16, hip_bfloat16)
+WRAP(EpCombineInterNodeV2LLRemotePartialTokenMajorQpEarlyV16, bf16,
+     hip_bfloat16)
 WRAP(EpCombineInterNodeV2LLSendLocalV16, bf16, hip_bfloat16)
 WRAP(EpCombineInterNodeV2LLSendLocalTokenMajorV16, bf16, hip_bfloat16)
+WRAP(EpCombineInterNodeV2LLLocalQpEarlyV16, bf16, hip_bfloat16)
+WRAP(EpCombineInterNodeV2LLLocalTokenMajorQpEarlyV16, bf16,
+     hip_bfloat16)
 WRAP(EpCombineInterNodeV2LLFinalize, bf16, hip_bfloat16)

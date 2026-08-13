@@ -49,7 +49,7 @@ static constexpr const char* kFp8BlockwiseScaleDimEnv = "MORI_FP8_COMBINE_SCALE_
 
 namespace {
 
-constexpr size_t kV2LLControlBarrierWords = 16;
+constexpr size_t kV2LLControlBarrierBaseWords = 16;
 
 const char* V2PhaseName(EpDispatchCombineHandle::V2LifecyclePhase phase) {
   switch (phase) {
@@ -577,9 +577,14 @@ void EpDispatchCombineHandle::FinalizeOrderMapBuf() {
 }
 
 void EpDispatchCombineHandle::InitializeBarrier() {
+  const size_t nNodes =
+      static_cast<size_t>(config.worldSize / config.gpuPerNode);
+  const size_t v2llControlWords =
+      kV2LLControlBarrierBaseWords +
+      nNodes * static_cast<size_t>(config.numQpPerPe);
   const size_t barrierWords =
       std::max({static_cast<size_t>(config.worldSize),
-                kV2LLControlBarrierWords});
+                v2llControlWords});
   const size_t barrierSize = barrierWords * sizeof(uint32_t);
   HIP_RUNTIME_CHECK(hipMalloc(&dispatchGridBarrier, barrierSize));
   HIP_RUNTIME_CHECK(hipMemset(dispatchGridBarrier, 0, barrierSize));

@@ -522,13 +522,17 @@ def _run_variable_stress(op, rank, dispatch_dtype, args, layout):
         source_indices = all_indices[rank][:count]
         source_weights = all_weights[rank][:count]
         source_scales = all_scales[rank][:count] if all_scales is not None else None
+        launch_kwargs = (
+            {}
+            if args.use_api_defaults
+            else {"block_num": args.blocks, "warp_per_block": args.warps}
+        )
         dispatch_result = op.dispatch_v2_standard_moe(
             source_x,
             source_weights,
             source_scales,
             source_indices,
-            block_num=args.blocks,
-            warp_per_block=args.warps,
+            **launch_kwargs,
         )
         torch.cuda.synchronize()
         _verify_stress_dispatch(
@@ -543,13 +547,17 @@ def _run_variable_stress(op, rank, dispatch_dtype, args, layout):
             layout,
         )
         _fill_stress_combine_input(rank, dispatch_result, combine_input, args, layout)
+        combine_kwargs = {"rdma_block_num": 1}
+        if not args.use_api_defaults:
+            combine_kwargs.update(
+                block_num=args.combine_blocks,
+                warp_per_block=args.combine_warps,
+            )
         output, _ = op.combine_standard_moe(
             combine_input,
             None,
             source_indices,
-            block_num=args.combine_blocks,
-            rdma_block_num=1,
-            warp_per_block=args.combine_warps,
+            **combine_kwargs,
         )
         torch.cuda.synchronize()
         expected = _torch_v2ll_reference(
@@ -632,7 +640,7 @@ def _worker(local_rank, args):
         num_qp_per_pe=args.rdma_qps,
         quant_type="none",
         v2_layout=args.layout,
-        v2_copy_block_num=args.copy_blocks,
+        v2_copy_block_num=(0 if args.use_api_defaults else args.copy_blocks),
     )
     op = mori.ops.EpDispatchCombineOp(config)
     torch.cuda.set_device(local_rank)
@@ -677,6 +685,7 @@ def main():
     parser.add_argument("--combine-warps", type=int, default=8)
     parser.add_argument("--validate-lifecycle", action="store_true")
     parser.add_argument("--rdma-qps", type=int, default=2)
+    parser.add_argument("--use-api-defaults", action="store_true")
     args = parser.parse_args()
     if args.max_tokens > 128:
         raise ValueError("max_tokens must be <= 128")
