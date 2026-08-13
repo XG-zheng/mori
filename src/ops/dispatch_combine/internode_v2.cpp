@@ -820,17 +820,30 @@ inline __device__ void ScatterNodeTokenMajor(EpDispatchCombineArgs<T>& args, int
   }
 }
 
-template <typename T, bool TokenMajor = false>
+template <typename T, bool TokenMajor = false, bool BlockRelease = false>
 inline __device__ void DispatchSyncCta(EpDispatchCombineArgs<T>& args, int expectedBlocks) {
   DEF_COMMON_VARS;
   __shared__ int isLastBlock;
   // Every lane participates in expert-major X copies. A lane-0-only fence does not publish
-  // writes issued by the other lanes before the CTA completion counter becomes visible.
-  __threadfence_system();
-  __syncthreads();
+  // writes issued by the other lanes before the CTA completion counter becomes visible. The
+  // expert-major multi-warp path first joins the CTA, then publishes all preceding writes through
+  // one system-scope release-sequence RMW instead of one system fence per thread. Token-major
+  // keeps the conservative path because its output publication contract is different.
+  if constexpr (BlockRelease) {
+    __syncthreads();
+  } else {
+    __threadfence_system();
+    __syncthreads();
+  }
   if (threadIdx.x == 0) {
+    const uint32_t previous =
+        BlockRelease
+            ? __hip_atomic_fetch_add(args.dispatchGridBarrier + 1, 1u,
+                                     __ATOMIC_ACQ_REL,
+                                     __HIP_MEMORY_SCOPE_SYSTEM)
+            : atomicAdd(args.dispatchGridBarrier + 1, 1u);
     isLastBlock =
-        (atomicAdd(args.dispatchGridBarrier + 1, 1u) + 1u == static_cast<uint32_t>(expectedBlocks));
+        (previous + 1u == static_cast<uint32_t>(expectedBlocks));
   }
   __syncthreads();
   if (!isLastBlock || warpId != 0) return;
@@ -1420,15 +1433,26 @@ inline __device__ void EpDispatchInterNodeV2LLKernelImpl(EpDispatchCombineArgs<T
       else
         v2::CopyToStagingGroup(args, blockId, copyBlockNum);
     }
-    // All vector-copy lanes must publish staging before the last producer posts RDMA.
-    __threadfence_system();
-    __syncthreads();
+    // All vector-copy lanes must publish staging before the last producer posts RDMA. The
+    // expert-major multi-warp path uses the CTA counter's system-scope release sequence as the
+    // publication edge. Token-major retains the per-thread fence path.
+    if constexpr (!TokenMajor && MultiWarpCopy) {
+      __syncthreads();
+    } else {
+      __threadfence_system();
+      __syncthreads();
+    }
     __shared__ int lastCopyBlock;
     if (threadIdx.x == 0) {
       uint32_t* copyCounter = args.dispatchGridBarrier;
       if constexpr (TokenMajor) copyCounter += v2::kQpCounterBaseSlot + qpId;
+      const uint32_t previous =
+          !TokenMajor && MultiWarpCopy
+              ? __hip_atomic_fetch_add(copyCounter, 1u, __ATOMIC_ACQ_REL,
+                                       __HIP_MEMORY_SCOPE_SYSTEM)
+              : atomicAdd(copyCounter, 1u);
       lastCopyBlock =
-          (atomicAdd(copyCounter, 1u) + 1u == static_cast<uint32_t>(qpBlockNum));
+          (previous + 1u == static_cast<uint32_t>(qpBlockNum));
       if (lastCopyBlock && TokenMajor) core::AtomicStoreRelaxed(copyCounter, 0u);
     }
     __syncthreads();
@@ -1462,7 +1486,8 @@ inline __device__ void EpDispatchInterNodeV2LLKernelImpl(EpDispatchCombineArgs<T
         v2::ScatterNode(args, node, receiverWarpId, receiverWarpNum);
     }
   }
-  v2::DispatchSyncCta<T, TokenMajor>(args, scatterBlockNum);
+  v2::DispatchSyncCta<T, TokenMajor, !TokenMajor && MultiWarpCopy>(
+      args, scatterBlockNum);
 }
 
 template <typename T, bool RingReceiver>
